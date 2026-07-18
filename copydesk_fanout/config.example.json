@@ -1,0 +1,26 @@
+{
+  "accounts": {
+    "masters": [
+      {
+        "account_id": "master_1",
+        "metatrader_dir_path": "C:/Users/YOU/AppData/Roaming/MetaQuotes/Terminal/<MASTER_TERMINAL_ID>/MQL5/Files/"
+      }
+    ],
+    "followers": [
+      {
+        "account_id": "follower_1",
+        "metatrader_dir_path": "C:/Users/YOU/AppData/Roaming/MetaQuotes/Terminal/<FOLLOWER_TERMINAL_ID>/MQL5/Files/"
+      }
+    ]
+  },
+  "masters": {
+    "master_1": [
+      {
+        "follower_account_id": "follower_1",
+        "multiplier": 1.0,
+        "sizing_mode": "fixed_multiplier",
+        "active": true
+      }
+    ]
+  }
+}

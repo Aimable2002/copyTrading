@@ -1,0 +1,15 @@
+myenv/
+copydesk_fanout/__pycache__/
+copydesk_fanout/*.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pyzw
+*.pyzwz
+*.pyzwzw
+*.pyzwzwz
+*.pyzwzwzw

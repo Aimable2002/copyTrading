@@ -1,0 +1,21 @@
+# ngrok config for tunneling the CopyDesk backend's Socket.IO server.
+#
+# Usage:
+#   ngrok start --config ngrok.yml backend
+#
+# Or skip this file entirely for a quick one-off tunnel:
+#   ngrok http 8000
+#
+# This file exists for when you want a consistent, named tunnel definition
+# (e.g. to add a reserved static domain on a paid ngrok plan later, so the
+# public URL stops changing every restart - see the `domain:` line below).
+
+version: "3"
+
+tunnels:
+  backend:
+    proto: http
+    addr: 8000   # must match PORT in .env - this is the port socket_server.py binds to on 0.0.0.0
+    # domain: your-reserved-name.ngrok-free.app   # uncomment + set once you have a static domain (paid tier);
+    #                                               without this, ngrok assigns a new random URL every run,
+    #                                               and you must update ALLOWED_ORIGINS in .env each time.
