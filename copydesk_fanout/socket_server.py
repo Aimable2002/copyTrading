@@ -41,14 +41,12 @@ import socketio
 
 logger = logging.getLogger("socket_server")
 
-# Read fresh at import time from the environment, not hardcoded, since
-# ngrok's URL changes across runs unless you're on a paid static domain.
-# Comma-separated in .env, e.g. "https://abcd1234.ngrok-free.app,http://localhost:5173"
-_ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in os.environ.get("ALLOWED_ORIGINS", "").split(",")
-    if origin.strip()
-] or "*"  # falls back to allow-all only if the env var is genuinely unset - fine for a first local run, tighten before real signups
+# TEMPORARY: allow-all while iterating with Lovable (its preview URL
+# changes across sessions/deploys, same reason ngrok's free-tier URL does).
+# TIGHTEN before real signups: set ALLOWED_ORIGINS in .env to the real
+# frontend domain(s) once one is stable, then change this back to actually
+# read that env var instead of hardcoding "*".
+_ALLOWED_ORIGINS = "*"
 
 sio = socketio.AsyncServer(
     async_mode="asgi",

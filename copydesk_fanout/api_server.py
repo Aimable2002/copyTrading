@@ -16,7 +16,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Literal
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .fanout_core import FanoutCore
@@ -59,6 +62,29 @@ def create_api_app(
     supabase/account_user_map/agents at startup and hands them in here,
     same objects the Socket.IO live-state publisher already reads from."""
     app = FastAPI(title="CopyDesk provisioning API")
+
+    # Allow-all for now, same reasoning as socket_server.py: Lovable's
+    # preview URL changes across sessions/deploys same as ngrok's does.
+    # TIGHTEN THIS before real signups - see socket_server.py's
+    # ALLOWED_ORIGINS handling for the pattern to switch to.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.exception_handler(RequestValidationError)
+    async def _log_validation_errors(request: Request, exc: RequestValidationError):
+        # Default FastAPI behavior already returns 422 with this detail -
+        # this handler only adds console visibility, doesn't change the
+        # response the frontend sees.
+        body = await request.body()
+        logger.warning(
+            "422 on %s - validation errors: %s | raw body sent: %s",
+            request.url.path, exc.errors(), body.decode(errors="replace"),
+        )
+        return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
     @app.post("/accounts/provision")
     def provision(body: ProvisionRequest, authorization: str | None = Header(default=None)):
