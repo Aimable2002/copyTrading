@@ -1,11 +1,6 @@
-# DWX Connect's python client (dwxconnect/python) and the fanout/sizing/
-# sltp/pair-store logic in this folder use only the standard library.
-#
-# Supabase mode (config sync + order-pair persistence) needs:
 supabase>=2.4,<3.0
-
-# Socket.IO server (--serve) - live account data pushed to the frontend,
-# meant to run behind ngrok. See README_NGROK.md.
 python-socketio>=5.11,<6.0
 uvicorn>=0.29,<1.0
 pyjwt>=2.8,<3.0
+fastapi>=0.110,<1.0
+pydantic>=2.6,<3.0

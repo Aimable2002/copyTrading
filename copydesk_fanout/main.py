@@ -132,43 +132,69 @@ def _run_supabase_mode(serve: bool) -> None:
     # build plan, not yet implemented here.
 
     if serve:
-        _run_agents_with_server(agents, fanout, supabase, account_user_map)
+        _run_agents_with_server(agents, fanout, supabase, account_user_map, pair_store)
     else:
         _run_agents(agents)
 
 
 def _run_agents_with_server(
-    agents: list[TerminalAgent], fanout: FanoutCore, supabase, account_user_map: dict[str, str]
+    agents: list[TerminalAgent],
+    fanout: FanoutCore,
+    supabase,
+    account_user_map: dict[str, str],
+    pair_store: OrderPairStore,
 ) -> None:
     """Starts every agent's own background polling thread (non-blocking,
     same as _run_agents), then hands the main thread over to a single
-    asyncio loop running the Socket.IO/uvicorn server and the live-state
-    publisher together - this is the process meant to sit behind the ngrok
-    tunnel (see README_NGROK.md). Ctrl+C stops both the server and the
-    agents together."""
+    asyncio loop running: the combined Socket.IO + provisioning-REST ASGI
+    app (uvicorn), the live-state publisher, and a periodic stale-pending
+    sweep (order_pair_store.py's expire_stale_pending - cleans up copies
+    the follower's EA rejected, since those errors can't be correlated
+    directly). This is the process meant to sit behind the ngrok tunnel.
+    Ctrl+C stops the server, the agents, and the sweep together.
+
+    `agents` is a live, mutable list (not a snapshot) - api_server.py's
+    /accounts/provision endpoint appends newly provisioned agents to this
+    same list at runtime, so they get started/stopped alongside everything
+    registered at process startup."""
     import asyncio
     import os
 
+    import socketio as socketio_lib
     import uvicorn
 
+    from .api_server import create_api_app
     from .live_state_publisher import run_live_state_publisher
-    from .socket_server import asgi_app
+    from .socket_server import sio
 
     for agent in agents:
         agent.start()
-    logger.info("%d agent(s) started, bringing up Socket.IO server...", len(agents))
+    logger.info("%d agent(s) started, bringing up API + Socket.IO server...", len(agents))
+
+    api_app = create_api_app(
+        fanout=fanout, supabase_client=supabase, account_user_map=account_user_map, agents=agents,
+    )
+    combined_app = socketio_lib.ASGIApp(sio, other_asgi_app=api_app)
+
+    async def _stale_pending_sweep(interval_seconds: float = 30.0) -> None:
+        loop = asyncio.get_event_loop()
+        while True:
+            await asyncio.sleep(interval_seconds)
+            await loop.run_in_executor(None, pair_store.expire_stale_pending)
 
     async def _serve_async() -> None:
         port = int(os.environ.get("PORT", "8000"))
-        config = uvicorn.Config(asgi_app, host="0.0.0.0", port=port, log_level="info")
+        config = uvicorn.Config(combined_app, host="0.0.0.0", port=port, log_level="info")
         server = uvicorn.Server(config)
         logger.info(
-            "Socket.IO server listening on 0.0.0.0:%d - point `ngrok http %d` at this port", port, port,
+            "API + Socket.IO server listening on 0.0.0.0:%d (POST /accounts/provision, "
+            "Socket.IO at /) - point `ngrok http %d` at this port", port, port,
         )
         publisher_task = asyncio.create_task(
             run_live_state_publisher(fanout, account_user_map, supabase)
         )
-        await asyncio.gather(server.serve(), publisher_task)
+        sweep_task = asyncio.create_task(_stale_pending_sweep())
+        await asyncio.gather(server.serve(), publisher_task, sweep_task)
 
     try:
         asyncio.run(_serve_async())

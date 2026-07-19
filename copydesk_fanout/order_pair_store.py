@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger("order_pair_store")
@@ -18,6 +19,7 @@ class PendingCopy:
     master_ticket: str
     follower_account_id: str
     dispatched_lots: float
+    created_at: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -248,6 +250,39 @@ class OrderPairStore:
         # completed copies instead of erasing history on every close.
         for follower_account_id in followers:
             self._mark_pair_closed(master_account_id, master_ticket, follower_account_id)
+
+    def expire_stale_pending(self, max_age_seconds: float = 60.0) -> list[PendingCopy]:
+        """Call periodically (see main.py's sweep task). A pending copy
+        still unconfirmed after max_age_seconds almost always means the
+        follower's EA rejected the order - MaximumOrders/MaximumLotSize
+        reached, invalid symbol, broker reject, etc (see the SendError
+        calls in mql/DWX_Server_MT5.mq5's OpenOrder()). Those errors don't
+        carry the comment/master_ticket needed to correlate directly, so
+        this timeout is the backstop that actually clears them rather than
+        leaving a pending_copies row (and in-memory entry) orphaned
+        forever. Returns what it expired, for logging/alerting by the caller."""
+        expired: list[PendingCopy] = []
+        now = time.monotonic()
+        with self._lock:
+            for follower_account_id, pending_list in list(self._pending.items()):
+                still_pending = []
+                for pending in pending_list:
+                    if now - pending.created_at > max_age_seconds:
+                        expired.append(pending)
+                    else:
+                        still_pending.append(pending)
+                self._pending[follower_account_id] = still_pending
+
+        for pending in expired:
+            logger.warning(
+                "Pending copy master %s#%s -> follower %s never confirmed after %.0fs - "
+                "dropping it, likely rejected by the follower's EA (check that terminal's "
+                "Experts log)",
+                pending.master_account_id, pending.master_ticket, pending.follower_account_id, max_age_seconds,
+            )
+            self._delete_pending_row(pending.master_account_id, pending.master_ticket, pending.follower_account_id)
+
+        return expired
 
     def find_master_ticket_by_follower_ticket(self, follower_account_id: str, follower_ticket: str) -> str | None:
         """Used when a follower's copied position gets closed - need to know

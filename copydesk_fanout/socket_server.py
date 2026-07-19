@@ -60,24 +60,60 @@ asgi_app = socketio.ASGIApp(sio)
 _session_users: dict[str, str] = {}
 
 
-def _verify_supabase_jwt(token: str) -> str:
+def verify_supabase_jwt(token: str) -> str:
     """Returns the user_id (the JWT's `sub` claim) if the token is a valid,
     unexpired Supabase-issued access token. Raises jwt.InvalidTokenError
     (or a subclass) otherwise - callers must catch this and reject the
     connection, never let a client through unauthenticated.
 
-    SUPABASE_JWT_SECRET is Project Settings -> API -> JWT Settings -> JWT
-    Secret in the Supabase dashboard - NOT the anon key and NOT the service
-    role key. It's what Supabase itself signs user access tokens with.
+    Supabase projects sign tokens one of two ways, and this handles both:
+      - Legacy HS256: a single shared secret (SUPABASE_JWT_SECRET, from
+        Project Settings -> API -> JWT Settings -> Legacy JWT Secret -
+        NOT the anon key, NOT the service role key).
+      - New asymmetric ES256/RS256 (Project Settings -> JWT Keys -> JWT
+        Signing Keys, the default for any project that's rotated): verified
+        against Supabase's public JWKS endpoint instead of a shared secret -
+        no secret to configure for this path, just SUPABASE_URL (already
+        required elsewhere, e.g. supabase_client.py).
+    Which one to use is read straight off the token's own header (`alg`),
+    not guessed - a project that's rotated issues ES256 tokens going
+    forward, so this checks the actual token rather than assuming.
     """
-    secret = os.environ.get("SUPABASE_JWT_SECRET")
-    if not secret:
-        raise RuntimeError(
-            "SUPABASE_JWT_SECRET is not set - cannot verify any client connection. "
-            "Copy .env.example and fill it in before running the socket server."
-        )
-    payload = jwt.decode(token, secret, algorithms=["HS256"], audience="authenticated")
+    header = jwt.get_unverified_header(token)
+    algorithm = header.get("alg", "HS256")
+
+    if algorithm == "HS256":
+        secret = os.environ.get("SUPABASE_JWT_SECRET")
+        if not secret:
+            raise RuntimeError(
+                "SUPABASE_JWT_SECRET is not set - cannot verify this HS256 token. "
+                "Copy .env.example and fill it in before running the socket server."
+            )
+        payload = jwt.decode(token, secret, algorithms=["HS256"], audience="authenticated")
+    else:
+        signing_key = _get_jwks_client().get_signing_key_from_jwt(token)
+        payload = jwt.decode(token, signing_key.key, algorithms=[algorithm], audience="authenticated")
+
     return payload["sub"]
+
+
+_jwks_client: "jwt.PyJWKClient | None" = None
+
+
+def _get_jwks_client() -> "jwt.PyJWKClient":
+    """Lazy + cached: one client reused for the process lifetime, so keys
+    already seen don't trigger a network fetch on every single request."""
+    global _jwks_client
+    if _jwks_client is None:
+        supabase_url = os.environ.get("SUPABASE_URL")
+        if not supabase_url:
+            raise RuntimeError(
+                "SUPABASE_URL is not set - needed to fetch the JWKS endpoint for verifying "
+                "asymmetric (ES256/RS256) tokens."
+            )
+        jwks_url = f"{supabase_url.rstrip('/')}/auth/v1/.well-known/jwks.json"
+        _jwks_client = jwt.PyJWKClient(jwks_url, cache_keys=True)
+    return _jwks_client
 
 
 @sio.event
@@ -95,7 +131,7 @@ async def connect(sid: str, environ: dict[str, Any], auth: dict[str, Any] | None
         return False
 
     try:
-        user_id = _verify_supabase_jwt(token)
+        user_id = verify_supabase_jwt(token)
     except jwt.InvalidTokenError:
         logger.warning("Connection %s rejected: invalid/expired token", sid)
         return False
