@@ -103,12 +103,21 @@ def _run_supabase_mode(serve: bool) -> None:
 
     fanout = FanoutCore(config_store, pair_store)
 
-    accounts_response = supabase.table("accounts").select("*").eq("status", "live").execute()
+    # 'paused' accounts still need a running, polled agent - see
+    # account_lifecycle.py's docstring: pausing only flips
+    # subscriptions.active to stop NEW copies, it never stops the agent
+    # itself, so existing open fills keep receiving close/modify/partial
+    # propagation. Only 'live' and 'paused' accounts should have agents
+    # recreated on startup; 'provisioning'/'failed'/'stopped'/'closed'
+    # accounts intentionally do not.
+    accounts_response = (
+        supabase.table("accounts").select("*").in_("status", ["live", "paused"]).execute()
+    )
     accounts = accounts_response.data or []
     if not accounts:
         logger.warning(
-            "No accounts with status='live' found in Supabase - nothing to do until the "
-            "provisioning service marks some accounts live."
+            "No accounts with status in ('live', 'paused') found in Supabase - nothing to do "
+            "until the provisioning service marks some accounts live."
         )
 
     agents: list[TerminalAgent] = []
