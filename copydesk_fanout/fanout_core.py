@@ -40,6 +40,12 @@ class FanoutCore:
     def register_follower(self, agent: FollowerAgent) -> None:
         self.follower_agents[agent.account_id] = agent
 
+    def unregister_master(self, account_id: str) -> None:
+        self.master_agents.pop(account_id, None)
+
+    def unregister_follower(self, account_id: str) -> None:
+        self.follower_agents.pop(account_id, None)
+
     # ------------------------------------------------------------------ #
     # Master side
     # ------------------------------------------------------------------ #
@@ -260,7 +266,7 @@ class FanoutCore:
                 tp=master_order.get("TP", 0),
             )
             if not sl_distance and not tp_distance:
-                return  # master trade has no SL/TP set - nothing to inherit
+                return  
 
             follower_sl, follower_tp = apply_sl_tp_distance(
                 order_type=follower_order["type"],

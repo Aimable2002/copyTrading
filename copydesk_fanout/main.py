@@ -41,6 +41,12 @@ from .terminal_agent import TerminalAgent
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("main")
 
+# Supabase's client logs every single HTTP call at INFO - noise, not signal.
+# Our own loggers (main, fanout_core, order_pair_store, config_store) are
+# untouched by this and keep printing normally.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 def _run_local_file_mode(config_path: Path) -> None:
     if not config_path.exists():

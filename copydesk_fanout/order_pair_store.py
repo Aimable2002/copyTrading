@@ -293,3 +293,15 @@ class OrderPairStore:
                 if fill and fill.ticket == follower_ticket:
                     return master_ticket
             return None
+
+    def get_all_fills_for_follower(self, follower_account_id: str) -> dict[tuple[str, str], FollowerFill]:
+        """Every currently-open pair this follower is part of, keyed by
+        (master_account_id, master_ticket) - used by account_lifecycle.py's
+        force-close-on-pause path."""
+        with self._lock:
+            return {
+                key: followers[follower_account_id]
+                for key, followers in self._pairs.items()
+                if follower_account_id in followers
+            }
+            

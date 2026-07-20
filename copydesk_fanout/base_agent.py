@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 # Make the official repo's python/api package importable without copying or
@@ -68,3 +69,28 @@ class BaseAgent:
 
     def on_historic_trades(self) -> None:
         pass
+
+    def fetch_historic_trades(self, lookback_days: int = 30, timeout: float = 10.0) -> dict:
+        """Requests MT5's own real closed-trade record via DWX Connect's
+        GET_HISTORIC_TRADES command (see dwx_client.py's get_historic_trades)
+        and waits for the EA to write it back. Returns dwx_client's raw
+        historic_trades dict completely as-is - every field in it
+        (symbol, lots, type, entry, deal_time, deal_price, pnl, commission,
+        swap, comment) is MT5's own broker-computed value, straight from
+        HistoryDealGet* calls in the EA (see mql/DWX_Server_MT5.mq5's
+        GET_HISTORIC_TRADES handler). No computation, no renaming, no
+        filtering happens here - that's deliberate, this is a pass-through,
+        not a transform.
+
+        Blocking (polls in the calling thread) - callers in an async context
+        (e.g. api_server.py's routes) should run this in an executor."""
+        self.dwx.historic_trades = {}  
+        self.dwx.get_historic_trades(lookback_days)
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.dwx.historic_trades:
+                return dict(self.dwx.historic_trades)
+            time.sleep(0.1)
+        return {} 
+

@@ -202,7 +202,7 @@ def provision_account(
         config_path = _write_startup_config(
             instance_dir, login=login, password=password, server=server, set_file=set_path
         )
-        _launch_terminal(instance_dir, config_path)
+        launched_process = _launch_terminal(instance_dir, config_path)
 
         metatrader_dir_path = _metatrader_files_path(instance_dir)
 
@@ -221,6 +221,7 @@ def provision_account(
             )
 
         agent.start()
+        agent.terminal_process = launched_process  # noqa: attribute added dynamically - see account_lifecycle.py's close_account
         _wait_until_connected(agent)
 
     except ProvisioningError:
