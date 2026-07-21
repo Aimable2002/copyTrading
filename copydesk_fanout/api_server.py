@@ -219,8 +219,7 @@ def create_api_app(
         agent = fanout.master_agents.get(account_id)
         if agent is None:
             raise HTTPException(status_code=409, detail=f"Master {account_id} has no running agent right now")
+        # print("testing what is returned for master :", trade_history.get_account_trade_history(agent))
         return trade_history.get_account_trade_history(agent)
-
     return app
 
-    

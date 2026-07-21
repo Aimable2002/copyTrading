@@ -16,7 +16,7 @@ _DWXCONNECT_PYTHON_DIR = Path(__file__).resolve().parent.parent / "python"
 if str(_DWXCONNECT_PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(_DWXCONNECT_PYTHON_DIR))
 
-from api.dwx_client import dwx_client  # noqa: E402  (import after sys.path setup, official package)
+from python.api.dwx_client import dwx_client 
 
 
 class BaseAgent:
