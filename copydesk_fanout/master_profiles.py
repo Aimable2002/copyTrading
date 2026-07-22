@@ -20,6 +20,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from .supabase_client import execute_with_retry
+
 logger = logging.getLogger("master_profiles")
 
 
@@ -37,16 +39,18 @@ def upsert_profile(
     if not display_name.strip():
         raise MasterProfileError("display_name cannot be empty")
 
-    supabase_client.table("master_profiles").upsert(
-        {
-            "master_account_id": account_id,
-            "user_id": user_id,
-            "display_name": display_name.strip(),
-            "bio": bio.strip(),
-            "is_public": is_public,
-        },
-        on_conflict="master_account_id",
-    ).execute()
+    execute_with_retry(
+        lambda: supabase_client.table("master_profiles").upsert(
+            {
+                "master_account_id": account_id,
+                "user_id": user_id,
+                "display_name": display_name.strip(),
+                "bio": bio.strip(),
+                "is_public": is_public,
+            },
+            on_conflict="master_account_id",
+        ).execute()
+    )
 
     logger.info("Upserted master profile for %s (is_public=%s)", account_id, is_public)
     return {"account_id": account_id, "display_name": display_name, "is_public": is_public}
@@ -59,11 +63,13 @@ def is_public_master(account_id: str, supabase_client: Any) -> bool:
     anyone authenticated can see this specific account's data, but only if
     its owner explicitly opted in via upsert_profile(is_public=True). A
     private master or a follower's own account is never reachable this way."""
-    response = (
-        supabase_client.table("master_profiles")
-        .select("is_public")
-        .eq("master_account_id", account_id)
-        .execute()
+    response = execute_with_retry(
+        lambda: (
+            supabase_client.table("master_profiles")
+            .select("is_public")
+            .eq("master_account_id", account_id)
+            .execute()
+        )
     )
     rows = response.data or []
     return bool(rows) and rows[0].get("is_public", False)
@@ -79,23 +85,27 @@ def list_public_masters(supabase_client: Any) -> list[dict]:
     that syntax's exact behavior through supabase-py isn't something to
     guess at without a live instance to verify against; this version is
     slower but unambiguously correct."""
-    profiles_response = (
-        supabase_client.table("master_profiles")
-        .select("master_account_id, display_name, bio")
-        .eq("is_public", True)
-        .execute()
+    profiles_response = execute_with_retry(
+        lambda: (
+            supabase_client.table("master_profiles")
+            .select("master_account_id, display_name, bio")
+            .eq("is_public", True)
+            .execute()
+        )
     )
     profiles = profiles_response.data or []
     if not profiles:
         return []
 
     account_ids = [p["master_account_id"] for p in profiles]
-    live_response = (
-        supabase_client.table("accounts")
-        .select("account_id")
-        .in_("account_id", account_ids)
-        .eq("status", "live")
-        .execute()
+    live_response = execute_with_retry(
+        lambda: (
+            supabase_client.table("accounts")
+            .select("account_id")
+            .in_("account_id", account_ids)
+            .eq("status", "live")
+            .execute()
+        )
     )
     live_ids = {row["account_id"] for row in (live_response.data or [])}
 
