@@ -83,8 +83,23 @@ class BaseAgent:
         not a transform.
 
         Blocking (polls in the calling thread) - callers in an async context
-        (e.g. api_server.py's routes) should run this in an executor."""
-        self.dwx.historic_trades = {}  
+        (e.g. api_server.py's routes) should run this in an executor.
+
+        Also resets dwx_client's own _last_historic_trades_str dedup guard,
+        not just historic_trades itself. check_historic_data()'s poll loop
+        only processes a response file when its text differs from that
+        stored string - if the EA's fresh reply happens to be byte-identical
+        to the last one this client ever received (i.e. no new deals since
+        the previous fetch, the common case for repeated polling), the loop
+        silently skips assigning historic_trades AND skips removing the
+        response file, so this function spins until timeout and returns {}
+        even though the EA answered correctly. A fresh dwx_client (as in
+        the standalone isolation test) never hits this because its dedup
+        string starts empty; a long-running agent hits it on every fetch
+        after the first. Clearing it here forces the next reply, whatever
+        its content, to be treated as new."""
+        self.dwx.historic_trades = {}
+        self.dwx._last_historic_trades_str = ""
         self.dwx.get_historic_trades(lookback_days)
 
         deadline = time.monotonic() + timeout
@@ -92,5 +107,4 @@ class BaseAgent:
             if self.dwx.historic_trades:
                 return dict(self.dwx.historic_trades)
             time.sleep(0.1)
-        return {} 
-
+        return {}

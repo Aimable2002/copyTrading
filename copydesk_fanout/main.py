@@ -178,6 +178,7 @@ def _run_agents_with_server(
     import socketio as socketio_lib
     import uvicorn
 
+    from . import billing, profit_share
     from .api_server import create_api_app
     from .live_state_publisher import run_live_state_publisher
     from .socket_server import sio
@@ -197,6 +198,29 @@ def _run_agents_with_server(
             await asyncio.sleep(interval_seconds)
             await loop.run_in_executor(None, pair_store.expire_stale_pending)
 
+    async def _billing_grace_sweep(interval_seconds: float = 300.0) -> None:
+        """Closes any billing_period past its 5-day grace window. 5 minutes
+        is plenty for a check whose actual threshold is measured in days -
+        no reason to poll this as tightly as the stale-pending sweep,
+        which is cleaning up something that can go wrong within seconds."""
+        loop = asyncio.get_event_loop()
+        while True:
+            await asyncio.sleep(interval_seconds)
+            await loop.run_in_executor(None, billing.check_grace_expirations, fanout, supabase, agents)
+
+    async def _profit_share_sweep(interval_seconds: float = 60.0) -> None:
+        """Bills newly-closed profitable follower deals. Runs more often
+        than the billing-grace sweep since this is the thing a follower
+        actually sees move (their wallet balance, per the "updated the
+        moment it's touched" requirement) - a full minute of lag between a
+        trade closing and its charge landing is already a compromise
+        against hitting the MT5/EA polling path this hard on every
+        follower, every few seconds."""
+        loop = asyncio.get_event_loop()
+        while True:
+            await asyncio.sleep(interval_seconds)
+            await loop.run_in_executor(None, lambda: profit_share.run_poll_cycle(fanout=fanout, account_user_map=account_user_map, supabase_client=supabase))
+
     async def _serve_async() -> None:
         port = int(os.environ.get("PORT", "8000"))
         config = uvicorn.Config(combined_app, host="0.0.0.0", port=port, log_level="info")
@@ -209,7 +233,9 @@ def _run_agents_with_server(
             run_live_state_publisher(fanout, account_user_map, supabase)
         )
         sweep_task = asyncio.create_task(_stale_pending_sweep())
-        await asyncio.gather(server.serve(), publisher_task, sweep_task)
+        billing_sweep_task = asyncio.create_task(_billing_grace_sweep())
+        profit_share_sweep_task = asyncio.create_task(_profit_share_sweep())
+        await asyncio.gather(server.serve(), publisher_task, sweep_task, billing_sweep_task, profit_share_sweep_task)
 
     try:
         asyncio.run(_serve_async())

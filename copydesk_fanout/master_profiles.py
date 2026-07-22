@@ -100,8 +100,23 @@ def list_public_masters(supabase_client: Any) -> list[dict]:
     live_ids = {row["account_id"] for row in (live_response.data or [])}
 
     return [
-        {"account_id": p["master_account_id"], "display_name": p["display_name"], "bio": p["bio"]}
+        {
+            "account_id": p["master_account_id"],
+            "display_name": p["display_name"],
+            "bio": p["bio"],
+            "rate_percent": _get_rate_or_none(p["master_account_id"], supabase_client),
+        }
         for p in profiles
         if p["master_account_id"] in live_ids
     ]
-    
+
+
+def _get_rate_or_none(master_account_id: str, supabase_client: Any) -> float | None:
+    """One query per listed master - fine at directory-listing scale,
+    worth batching into a single IN query if this list ever grows large
+    enough for it to matter. Deliberately imported here rather than at
+    module level to avoid a master_profiles<->master_rate import cycle,
+    since neither module otherwise needs the other."""
+    from .master_rate import get_public_rate
+    rate = get_public_rate(master_account_id, supabase_client)
+    return rate["rate_percent"] if rate else None
