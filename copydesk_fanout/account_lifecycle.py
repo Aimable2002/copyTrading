@@ -47,6 +47,7 @@ from typing import Any, Literal
 
 from .fanout_core import FanoutCore
 from .follower_agent import FollowerAgent
+from .supabase_client import execute_with_retry
 from .terminal_agent import TerminalAgent
 
 logger = logging.getLogger("account_lifecycle")
@@ -68,7 +69,9 @@ def _get_agent(fanout: FanoutCore, account_id: str, role: Role) -> TerminalAgent
 
 def _set_subscriptions_active(supabase_client: Any, *, account_id: str, role: Role, active: bool) -> None:
     column = "master_account_id" if role == "master" else "follower_account_id"
-    supabase_client.table("subscriptions").update({"active": active}).eq(column, account_id).execute()
+    execute_with_retry(
+        lambda: supabase_client.table("subscriptions").update({"active": active}).eq(column, account_id).execute()
+    )
 
 
 def _force_close_all_fills(fanout: FanoutCore, account_id: str, role: Role) -> int:
@@ -119,7 +122,9 @@ def pause_account(
 
     closed_count = _force_close_all_fills(fanout, account_id, role) if force_close else 0
 
-    supabase_client.table("accounts").update({"status": "paused"}).eq("account_id", account_id).execute()
+    execute_with_retry(
+        lambda: supabase_client.table("accounts").update({"status": "paused"}).eq("account_id", account_id).execute()
+    )
     logger.info("Paused %s account %s (force_close=%s, closed %d fill(s))", role, account_id, force_close, closed_count)
     return {"account_id": account_id, "status": "paused", "closed_fills": closed_count}
 
@@ -127,7 +132,9 @@ def pause_account(
 def resume_account(*, account_id: str, role: Role, fanout: FanoutCore, supabase_client: Any) -> dict:
     _get_agent(fanout, account_id, role)  # the agent must still be running (paused ≠ stopped) - raises if not
     _set_subscriptions_active(supabase_client, account_id=account_id, role=role, active=True)
-    supabase_client.table("accounts").update({"status": "live"}).eq("account_id", account_id).execute()
+    execute_with_retry(
+        lambda: supabase_client.table("accounts").update({"status": "live"}).eq("account_id", account_id).execute()
+    )
     logger.info("Resumed %s account %s", role, account_id)
     return {"account_id": account_id, "status": "live"}
 
@@ -162,6 +169,8 @@ def close_account(
             account_id,
         )
 
-    supabase_client.table("accounts").update({"status": "closed"}).eq("account_id", account_id).execute()
+    execute_with_retry(
+        lambda: supabase_client.table("accounts").update({"status": "closed"}).eq("account_id", account_id).execute()
+    )
     logger.info("Closed %s account %s (closed %d fill(s) first)", role, account_id, closed_count)
     return {"account_id": account_id, "status": "closed", "closed_fills": closed_count}

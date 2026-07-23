@@ -50,6 +50,7 @@ from typing import Any, Literal
 
 from .fanout_core import FanoutCore
 from .follower_agent import FollowerAgent
+from .supabase_client import execute_with_retry
 from .terminal_agent import TerminalAgent
 
 logger = logging.getLogger("provisioning")
@@ -271,26 +272,30 @@ def provision_account(
     agents.append(agent)
     account_user_map[account_id] = user_id
 
-    supabase_client.table("accounts").insert(
-        {
-            "account_id": account_id,
-            "user_id": user_id,
-            "role": role,
-            "metatrader_dir_path": metatrader_dir_path,
-            "status": "live",
-        }
-    ).execute()
-
-    if role == "follower":
-        supabase_client.table("subscriptions").insert(
+    execute_with_retry(
+        lambda: supabase_client.table("accounts").insert(
             {
-                "master_account_id": master_account_id,
-                "follower_account_id": account_id,
-                "multiplier": multiplier,
-                "sizing_mode": sizing_mode,
-                "active": True,
+                "account_id": account_id,
+                "user_id": user_id,
+                "role": role,
+                "metatrader_dir_path": metatrader_dir_path,
+                "status": "live",
             }
         ).execute()
+    )
+
+    if role == "follower":
+        execute_with_retry(
+            lambda: supabase_client.table("subscriptions").insert(
+                {
+                    "master_account_id": master_account_id,
+                    "follower_account_id": account_id,
+                    "multiplier": multiplier,
+                    "sizing_mode": sizing_mode,
+                    "active": True,
+                }
+            ).execute()
+        )
         # ConfigStore's realtime sync (already running in the background,
         # see config_store.py's start_realtime_sync) picks this row up on
         # its own INSERT listener - no direct config_store call needed here.

@@ -21,6 +21,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from .supabase_client import execute_with_retry
+
 logger = logging.getLogger("master_rate")
 
 
@@ -35,13 +37,15 @@ def set_rate(master_account_id: str, rate_percent: float, platform_cut_percent: 
         raise MasterRateError("platform_cut_percent must be between 0 and rate_percent")
 
     master_net_percent = rate_percent - platform_cut_percent
-    supabase_client.table("master_rates").insert(
-        {
-            "master_account_id": master_account_id,
-            "rate_percent": rate_percent,
-            "platform_cut_percent": platform_cut_percent,
-        }
-    ).execute()
+    execute_with_retry(
+        lambda: supabase_client.table("master_rates").insert(
+            {
+                "master_account_id": master_account_id,
+                "rate_percent": rate_percent,
+                "platform_cut_percent": platform_cut_percent,
+            }
+        ).execute()
+    )
 
     logger.info(
         "Master %s set rate to %.2f%% (platform cut %.2f%%, master nets %.2f%%)",
@@ -57,13 +61,15 @@ def set_rate(master_account_id: str, rate_percent: float, platform_cut_percent: 
 
 def get_current_rate(master_account_id: str, supabase_client: Any) -> dict | None:
     """Full detail, including platform_cut_percent - master-facing only."""
-    response = (
-        supabase_client.table("master_rates")
-        .select("rate_percent, platform_cut_percent, effective_from")
-        .eq("master_account_id", master_account_id)
-        .order("effective_from", desc=True)
-        .limit(1)
-        .execute()
+    response = execute_with_retry(
+        lambda: (
+            supabase_client.table("master_rates")
+            .select("rate_percent, platform_cut_percent, effective_from")
+            .eq("master_account_id", master_account_id)
+            .order("effective_from", desc=True)
+            .limit(1)
+            .execute()
+        )
     )
     rows = response.data or []
     if not rows:
@@ -92,15 +98,17 @@ def snapshot_rate_for_copy(
     if current is None:
         raise MasterRateError(f"Master {master_account_id} has not set a rate yet - cannot be copied")
 
-    supabase_client.table("follower_copy_rates").insert(
-        {
-            "follower_account_id": follower_account_id,
-            "master_account_id": master_account_id,
-            "roster_slot_id": roster_slot_id,
-            "rate_percent": current["rate_percent"],
-            "platform_cut_percent": current["platform_cut_percent"],
-        }
-    ).execute()
+    execute_with_retry(
+        lambda: supabase_client.table("follower_copy_rates").insert(
+            {
+                "follower_account_id": follower_account_id,
+                "master_account_id": master_account_id,
+                "roster_slot_id": roster_slot_id,
+                "rate_percent": current["rate_percent"],
+                "platform_cut_percent": current["platform_cut_percent"],
+            }
+        ).execute()
+    )
 
     logger.info(
         "Snapshotted rate %.2f%% (platform %.2f%%) for follower %s copying master %s (slot %s)",
@@ -118,12 +126,14 @@ def snapshot_rate_for_copy(
 def get_copy_rate_for_slot(roster_slot_id: str, supabase_client: Any) -> dict | None:
     """What profit_share.py actually bills against - the locked-in
     snapshot for a specific roster slot, never the master's current rate."""
-    response = (
-        supabase_client.table("follower_copy_rates")
-        .select("rate_percent, platform_cut_percent")
-        .eq("roster_slot_id", roster_slot_id)
-        .limit(1)
-        .execute()
+    response = execute_with_retry(
+        lambda: (
+            supabase_client.table("follower_copy_rates")
+            .select("rate_percent, platform_cut_percent")
+            .eq("roster_slot_id", roster_slot_id)
+            .limit(1)
+            .execute()
+        )
     )
     rows = response.data or []
     return rows[0] if rows else None

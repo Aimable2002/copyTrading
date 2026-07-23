@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 
 from .base_agent import BaseAgent
 from .socket_server import emit_account_state
+from .supabase_client import execute_with_retry
 
 if TYPE_CHECKING:
     from .fanout_core import FanoutCore
@@ -68,16 +69,21 @@ def _build_state(agent: BaseAgent) -> dict[str, Any]:
 
 def _write_live_state_row(supabase_client: Any, account_id: str, state: dict[str, Any]) -> None:
     try:
-        supabase_client.table("live_account_state").upsert(
-            {
-                "account_id": account_id,
-                "balance": state["balance"],
-                "equity": state["equity"],
-                "open_positions": state["open_positions"],
-            },
-            on_conflict="account_id",
-        ).execute()
+        execute_with_retry(
+            lambda: supabase_client.table("live_account_state").upsert(
+                {
+                    "account_id": account_id,
+                    "balance": state["balance"],
+                    "equity": state["equity"],
+                    "open_positions": state["open_positions"],
+                },
+                on_conflict="account_id",
+            ).execute()
+        )
     except Exception:
+        # Still never raise into the publisher loop - this is a display
+        # cache write (see module docstring), not the hot trading path.
+        # Losing one tick's row is fine; crashing the publisher task is not.
         logger.exception("Failed to write live_account_state row for %s", account_id)
 
 
@@ -97,23 +103,29 @@ async def run_live_state_publisher(
         agents: dict[str, BaseAgent] = {**fanout.master_agents, **fanout.follower_agents}
 
         for account_id, agent in agents.items():
-            if not agent.is_connected:
-                continue  # EA hasn't written a first account_info payload yet - nothing to publish
-
-            user_id = account_user_map.get(account_id)
-            if not user_id:
-                logger.warning("No user_id mapped for account %s - skipping publish", account_id)
-                continue
-
-            state = _build_state(agent)
-
             try:
-                await emit_account_state(user_id, account_id, state)
-            except Exception:
-                logger.exception("Socket emit failed for account %s", account_id)
+                if not agent.is_connected:
+                    continue  # EA hasn't written a first account_info payload yet - nothing to publish
 
-            # Supabase write is a blocking network call - offload it so it
-            # can't stall the emit loop for every other account this tick.
-            await loop.run_in_executor(None, _write_live_state_row, supabase_client, account_id, state)
+                user_id = account_user_map.get(account_id)
+                if not user_id:
+                    logger.warning("No user_id mapped for account %s - skipping publish", account_id)
+                    continue
+
+                state = _build_state(agent)
+
+                try:
+                    await emit_account_state(user_id, account_id, state)
+                except Exception:
+                    logger.exception("Socket emit failed for account %s", account_id)
+
+                # Supabase write is a blocking network call - offload it so it
+                # can't stall the emit loop for every other account this tick.
+                await loop.run_in_executor(None, _write_live_state_row, supabase_client, account_id, state)
+            except Exception:
+                # One account's tick failing (bad data, unexpected attribute
+                # error, etc.) must not stop every other account from being
+                # published this tick, and must not kill the publisher task.
+                logger.exception("Live-state publish tick failed for account %s", account_id)
 
         await asyncio.sleep(interval_seconds)

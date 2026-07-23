@@ -33,6 +33,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Literal
 
+from .supabase_client import execute_with_retry
+
 logger = logging.getLogger("wallet")
 
 TransactionType = Literal[
@@ -53,11 +55,13 @@ def get_wallet(account_id: str, supabase_client: Any) -> dict | None:
     """None means this account has never bought a package yet - a valid
     state, not an error. Callers (API routes) should render that as
     "no wallet yet / buy a package to get started", not a 404."""
-    response = (
-        supabase_client.table("wallets")
-        .select("account_id, balance, debt_started_at, updated_at")
-        .eq("account_id", account_id)
-        .execute()
+    response = execute_with_retry(
+        lambda: (
+            supabase_client.table("wallets")
+            .select("account_id, balance, debt_started_at, updated_at")
+            .eq("account_id", account_id)
+            .execute()
+        )
     )
     rows = response.data or []
     if not rows:
@@ -74,9 +78,11 @@ def ensure_wallet(account_id: str, supabase_client: Any) -> dict:
     if existing is not None:
         return existing
 
-    supabase_client.table("wallets").insert(
-        {"account_id": account_id, "balance": 0, "debt_started_at": None}
-    ).execute()
+    execute_with_retry(
+        lambda: supabase_client.table("wallets").insert(
+            {"account_id": account_id, "balance": 0, "debt_started_at": None}
+        ).execute()
+    )
     logger.info("Created wallet for %s", account_id)
     return {"account_id": account_id, "balance": 0, "debt_started_at": None, "in_debt": False}
 
@@ -85,15 +91,17 @@ def _record_transaction(
     supabase_client: Any, *, account_id: str, type: TransactionType, amount: float,
     related_master_account_id: str | None = None, related_deal_ticket: str | None = None,
 ) -> None:
-    supabase_client.table("wallet_transactions").insert(
-        {
-            "account_id": account_id,
-            "type": type,
-            "amount": amount,
-            "related_master_account_id": related_master_account_id,
-            "related_deal_ticket": related_deal_ticket,
-        }
-    ).execute()
+    execute_with_retry(
+        lambda: supabase_client.table("wallet_transactions").insert(
+            {
+                "account_id": account_id,
+                "type": type,
+                "amount": amount,
+                "related_master_account_id": related_master_account_id,
+                "related_deal_ticket": related_deal_ticket,
+            }
+        ).execute()
+    )
 
 
 def top_up(account_id: str, amount: float, supabase_client: Any) -> dict:
@@ -107,9 +115,11 @@ def top_up(account_id: str, amount: float, supabase_client: Any) -> dict:
     new_balance = float(wallet["balance"]) + amount
     debt_started_at = wallet["debt_started_at"] if new_balance < 0 else None
 
-    supabase_client.table("wallets").update(
-        {"balance": new_balance, "debt_started_at": debt_started_at, "updated_at": _now_iso()}
-    ).eq("account_id", account_id).execute()
+    execute_with_retry(
+        lambda: supabase_client.table("wallets").update(
+            {"balance": new_balance, "debt_started_at": debt_started_at, "updated_at": _now_iso()}
+        ).eq("account_id", account_id).execute()
+    )
     _record_transaction(supabase_client, account_id=account_id, type="topup", amount=amount)
 
     logger.info("Top-up %.2f for %s -> new balance %.2f", amount, account_id, new_balance)
@@ -144,9 +154,11 @@ def debit(
     else:
         debt_started_at = None
 
-    supabase_client.table("wallets").update(
-        {"balance": new_balance, "debt_started_at": debt_started_at, "updated_at": _now_iso()}
-    ).eq("account_id", account_id).execute()
+    execute_with_retry(
+        lambda: supabase_client.table("wallets").update(
+            {"balance": new_balance, "debt_started_at": debt_started_at, "updated_at": _now_iso()}
+        ).eq("account_id", account_id).execute()
+    )
     _record_transaction(
         supabase_client, account_id=account_id, type=type, amount=-amount,
         related_master_account_id=related_master_account_id, related_deal_ticket=related_deal_ticket,
@@ -157,12 +169,14 @@ def debit(
 
 
 def list_transactions(account_id: str, supabase_client: Any, limit: int = 50) -> list[dict]:
-    response = (
-        supabase_client.table("wallet_transactions")
-        .select("id, type, amount, related_master_account_id, related_deal_ticket, created_at")
-        .eq("account_id", account_id)
-        .order("created_at", desc=True)
-        .limit(limit)
-        .execute()
+    response = execute_with_retry(
+        lambda: (
+            supabase_client.table("wallet_transactions")
+            .select("id, type, amount, related_master_account_id, related_deal_ticket, created_at")
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
     )
     return response.data or []

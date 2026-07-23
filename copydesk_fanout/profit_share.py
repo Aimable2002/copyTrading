@@ -29,17 +29,20 @@ from typing import Any
 
 from . import roster, trade_history, wallet
 from .master_rate import get_copy_rate_for_slot
+from .supabase_client import execute_with_retry
 
 logger = logging.getLogger("profit_share")
 
 
 def _already_billed(follower_account_id: str, deal_ticket: str, supabase_client: Any) -> bool:
-    response = (
-        supabase_client.table("billed_deals")
-        .select("deal_ticket")
-        .eq("follower_account_id", follower_account_id)
-        .eq("deal_ticket", deal_ticket)
-        .execute()
+    response = execute_with_retry(
+        lambda: (
+            supabase_client.table("billed_deals")
+            .select("deal_ticket")
+            .eq("follower_account_id", follower_account_id)
+            .eq("deal_ticket", deal_ticket)
+            .execute()
+        )
     )
     return bool(response.data)
 
@@ -89,16 +92,18 @@ def process_follower_deals(
             follower_account_id, master_amount, "profit_share_master", supabase_client,
             related_master_account_id=master_account_id, related_deal_ticket=ticket,
         )
-        supabase_client.table("billed_deals").insert(
-            {
-                "follower_account_id": follower_account_id,
-                "deal_ticket": ticket,
-                "master_account_id": master_account_id,
-                "pnl": pnl,
-                "platform_amount": platform_amount,
-                "master_amount": master_amount,
-            }
-        ).execute()
+        execute_with_retry(
+            lambda: supabase_client.table("billed_deals").insert(
+                {
+                    "follower_account_id": follower_account_id,
+                    "deal_ticket": ticket,
+                    "master_account_id": master_account_id,
+                    "pnl": pnl,
+                    "platform_amount": platform_amount,
+                    "master_amount": master_amount,
+                }
+            ).execute()
+        )
 
         charges.append({"deal_ticket": ticket, "pnl": pnl, "platform_amount": platform_amount, "master_amount": master_amount})
         logger.info(
@@ -117,13 +122,16 @@ def run_poll_cycle(*, fanout: Any, account_user_map: dict[str, str], supabase_cl
 
     total = 0
     for account_id, agent in fanout.follower_agents.items():
-        period = billing.get_active_period(account_id, supabase_client)
-        if period is None:
-            continue
-        charges = process_follower_deals(
-            follower_account_id=account_id, billing_period_id=period["id"], agent=agent, supabase_client=supabase_client,
-        )
-        total += len(charges)
+        try:
+            period = billing.get_active_period(account_id, supabase_client)
+            if period is None:
+                continue
+            charges = process_follower_deals(
+                follower_account_id=account_id, billing_period_id=period["id"], agent=agent, supabase_client=supabase_client,
+            )
+            total += len(charges)
+        except Exception:
+            logger.exception("Profit-share billing failed for follower %s this cycle - will retry next cycle", account_id)
     return total
 
 
@@ -134,13 +142,15 @@ def get_master_earnings(master_account_id: str, supabase_client: Any, limit: int
     being debited), so this is the one place that has to query across
     accounts by related_master_account_id instead of a single account_id,
     unlike everything else in wallet.py."""
-    response = (
-        supabase_client.table("wallet_transactions")
-        .select("account_id, amount, related_deal_ticket, created_at")
-        .eq("type", "profit_share_master")
-        .eq("related_master_account_id", master_account_id)
-        .order("created_at", desc=True)
-        .execute()
+    response = execute_with_retry(
+        lambda: (
+            supabase_client.table("wallet_transactions")
+            .select("account_id, amount, related_deal_ticket, created_at")
+            .eq("type", "profit_share_master")
+            .eq("related_master_account_id", master_account_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
     )
     rows = response.data or []
     # amount is stored negative (a debit from the follower's wallet) -

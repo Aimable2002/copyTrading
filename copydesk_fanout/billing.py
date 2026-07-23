@@ -33,6 +33,7 @@ from typing import Any
 
 from . import wallet
 from .account_lifecycle import LifecycleError, close_account, pause_account
+from .supabase_client import execute_with_retry
 
 logger = logging.getLogger("billing")
 
@@ -52,12 +53,14 @@ def get_package(package_code: str, supabase_client: Any) -> dict:
     pricing page reads the same `packages` table directly (it has its own
     public-read RLS policy, see migration 002), so there is exactly one
     source of truth for a price, editable without a backend deploy."""
-    response = (
-        supabase_client.table("packages")
-        .select("code, duration_days, infra_fee, slot_fee_per_slot, base_roster_size")
-        .eq("code", package_code)
-        .eq("is_active", True)
-        .execute()
+    response = execute_with_retry(
+        lambda: (
+            supabase_client.table("packages")
+            .select("code, duration_days, infra_fee, slot_fee_per_slot, base_roster_size")
+            .eq("code", package_code)
+            .eq("is_active", True)
+            .execute()
+        )
     )
     rows = response.data or []
     if not rows:
@@ -66,14 +69,16 @@ def get_package(package_code: str, supabase_client: Any) -> dict:
 
 
 def get_active_period(account_id: str, supabase_client: Any) -> dict | None:
-    response = (
-        supabase_client.table("billing_periods")
-        .select("*")
-        .eq("account_id", account_id)
-        .in_("status", ["active", "grace"])
-        .order("started_at", desc=True)
-        .limit(1)
-        .execute()
+    response = execute_with_retry(
+        lambda: (
+            supabase_client.table("billing_periods")
+            .select("*")
+            .eq("account_id", account_id)
+            .in_("status", ["active", "grace"])
+            .order("started_at", desc=True)
+            .limit(1)
+            .execute()
+        )
     )
     rows = response.data or []
     return rows[0] if rows else None
@@ -97,21 +102,23 @@ def select_package(*, account_id: str, package_code: str, role: str, fanout: Any
 
     started_at = _now()
     renews_at = started_at + timedelta(days=package["duration_days"])
-    insert_response = supabase_client.table("billing_periods").insert(
-        {
-            "account_id": account_id,
-            "package_code": package_code,
-            "duration_days": package["duration_days"],
-            "infra_fee": package["infra_fee"],
-            "slot_fee_per_slot": package["slot_fee_per_slot"],
-            "base_roster_size": package["base_roster_size"],
-            "purchased_extra_slots": 0,
-            "status": charge["status"],
-            "grace_started_at": _now().isoformat() if charge["status"] == "grace" else None,
-            "started_at": started_at.isoformat(),
-            "renews_at": renews_at.isoformat(),
-        }
-    ).execute()
+    insert_response = execute_with_retry(
+        lambda: supabase_client.table("billing_periods").insert(
+            {
+                "account_id": account_id,
+                "package_code": package_code,
+                "duration_days": package["duration_days"],
+                "infra_fee": package["infra_fee"],
+                "slot_fee_per_slot": package["slot_fee_per_slot"],
+                "base_roster_size": package["base_roster_size"],
+                "purchased_extra_slots": 0,
+                "status": charge["status"],
+                "grace_started_at": _now().isoformat() if charge["status"] == "grace" else None,
+                "started_at": started_at.isoformat(),
+                "renews_at": renews_at.isoformat(),
+            }
+        ).execute()
+    )
     period = insert_response.data[0]
 
     if charge["status"] == "grace":
@@ -134,20 +141,26 @@ def check_grace_expirations(fanout: Any, supabase_client: Any, agents: list) -> 
     """Scheduled sweep target - closes any billing_period that's been in
     grace longer than GRACE_PERIOD_DAYS. Returns the account_ids closed."""
     cutoff = (_now() - timedelta(days=GRACE_PERIOD_DAYS)).isoformat()
-    response = (
-        supabase_client.table("billing_periods")
-        .select("id, account_id")
-        .eq("status", "grace")
-        .lte("grace_started_at", cutoff)
-        .execute()
+    response = execute_with_retry(
+        lambda: (
+            supabase_client.table("billing_periods")
+            .select("id, account_id")
+            .eq("status", "grace")
+            .lte("grace_started_at", cutoff)
+            .execute()
+        )
     )
     closed: list[str] = []
     for row in response.data or []:
         account_id = row["account_id"]
-        supabase_client.table("billing_periods").update({"status": "closed"}).eq("id", row["id"]).execute()
+        execute_with_retry(
+            lambda row=row: supabase_client.table("billing_periods").update({"status": "closed"}).eq("id", row["id"]).execute()
+        )
         # Role isn't stored on billing_periods - look it up once via accounts,
         # same source api_server.py's account_user_map is built from.
-        acct = supabase_client.table("accounts").select("role").eq("account_id", account_id).execute().data
+        acct = execute_with_retry(
+            lambda account_id=account_id: supabase_client.table("accounts").select("role").eq("account_id", account_id).execute()
+        ).data
         role = acct[0]["role"] if acct else "follower"
         try:
             close_account(account_id=account_id, role=role, fanout=fanout, supabase_client=supabase_client, agents=agents)

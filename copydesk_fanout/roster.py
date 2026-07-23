@@ -39,6 +39,7 @@ import logging
 from typing import Any
 
 from . import master_rate, wallet
+from .supabase_client import execute_with_retry
 
 logger = logging.getLogger("roster")
 
@@ -48,22 +49,26 @@ class RosterError(Exception):
 
 
 def get_roster(billing_period_id: str, follower_account_id: str, supabase_client: Any) -> list[dict]:
-    response = (
-        supabase_client.table("roster_slots")
-        .select("id, master_account_id, is_current, first_used_at, last_used_at")
-        .eq("billing_period_id", billing_period_id)
-        .eq("follower_account_id", follower_account_id)
-        .execute()
+    response = execute_with_retry(
+        lambda: (
+            supabase_client.table("roster_slots")
+            .select("id, master_account_id, is_current, first_used_at, last_used_at")
+            .eq("billing_period_id", billing_period_id)
+            .eq("follower_account_id", follower_account_id)
+            .execute()
+        )
     )
     return response.data or []
 
 
 def _get_billing_period(billing_period_id: str, supabase_client: Any) -> dict:
-    response = (
-        supabase_client.table("billing_periods")
-        .select("id, account_id, status, base_roster_size, purchased_extra_slots, slot_fee_per_slot")
-        .eq("id", billing_period_id)
-        .execute()
+    response = execute_with_retry(
+        lambda: (
+            supabase_client.table("billing_periods")
+            .select("id, account_id, status, base_roster_size, purchased_extra_slots, slot_fee_per_slot")
+            .eq("id", billing_period_id)
+            .execute()
+        )
     )
     rows = response.data or []
     if not rows:
@@ -103,9 +108,11 @@ def switch_master(
             follower_account_id, period["slot_fee_per_slot"], "slot_fee", supabase_client,
             related_master_account_id=new_master_account_id,
         )
-        supabase_client.table("billing_periods").update(
-            {"purchased_extra_slots": period["purchased_extra_slots"] + 1}
-        ).eq("id", billing_period_id).execute()
+        execute_with_retry(
+            lambda: supabase_client.table("billing_periods").update(
+                {"purchased_extra_slots": period["purchased_extra_slots"] + 1}
+            ).eq("id", billing_period_id).execute()
+        )
         charged = True
         logger.info(
             "Follower %s bought a slot for new master %s (billing_period %s), wallet now %.2f",
@@ -114,14 +121,16 @@ def switch_master(
 
     # Flip every other slot to not-current, then insert the new current one.
     _clear_current(billing_period_id, follower_account_id, supabase_client)
-    insert_response = supabase_client.table("roster_slots").insert(
-        {
-            "billing_period_id": billing_period_id,
-            "follower_account_id": follower_account_id,
-            "master_account_id": new_master_account_id,
-            "is_current": True,
-        }
-    ).execute()
+    insert_response = execute_with_retry(
+        lambda: supabase_client.table("roster_slots").insert(
+            {
+                "billing_period_id": billing_period_id,
+                "follower_account_id": follower_account_id,
+                "master_account_id": new_master_account_id,
+                "is_current": True,
+            }
+        ).execute()
+    )
     new_slot_id = insert_response.data[0]["id"]
 
     rate_snapshot = master_rate.snapshot_rate_for_copy(
@@ -138,27 +147,33 @@ def switch_master(
 
 
 def _clear_current(billing_period_id: str, follower_account_id: str, supabase_client: Any) -> None:
-    supabase_client.table("roster_slots").update({"is_current": False}).eq(
-        "billing_period_id", billing_period_id
-    ).eq("follower_account_id", follower_account_id).execute()
+    execute_with_retry(
+        lambda: supabase_client.table("roster_slots").update({"is_current": False}).eq(
+            "billing_period_id", billing_period_id
+        ).eq("follower_account_id", follower_account_id).execute()
+    )
 
 
 def _set_current(billing_period_id: str, follower_account_id: str, roster_slot_id: str, supabase_client: Any) -> None:
     _clear_current(billing_period_id, follower_account_id, supabase_client)
-    supabase_client.table("roster_slots").update({"is_current": True}).eq("id", roster_slot_id).execute()
+    execute_with_retry(
+        lambda: supabase_client.table("roster_slots").update({"is_current": True}).eq("id", roster_slot_id).execute()
+    )
 
 
 def get_current_slot(billing_period_id: str, follower_account_id: str, supabase_client: Any) -> dict | None:
     """What profit_share.py's poller uses to find which master a
     follower's closed trades should be billed against."""
-    response = (
-        supabase_client.table("roster_slots")
-        .select("id, master_account_id")
-        .eq("billing_period_id", billing_period_id)
-        .eq("follower_account_id", follower_account_id)
-        .eq("is_current", True)
-        .limit(1)
-        .execute()
+    response = execute_with_retry(
+        lambda: (
+            supabase_client.table("roster_slots")
+            .select("id, master_account_id")
+            .eq("billing_period_id", billing_period_id)
+            .eq("follower_account_id", follower_account_id)
+            .eq("is_current", True)
+            .limit(1)
+            .execute()
+        )
     )
     rows = response.data or []
     return rows[0] if rows else None
