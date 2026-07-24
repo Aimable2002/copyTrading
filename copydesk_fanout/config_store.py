@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,15 @@ logger = logging.getLogger("config_store")
 # at module level) so this module still imports cleanly - and load_from_file
 # still works - in environments that never installed the `supabase` package,
 # e.g. quick local testing per the original isolated-testing README.
+
+# Reconnect backoff for the realtime sync loop (see _realtime_sync_forever).
+# If the connection stays up for at least _HEALTHY_CONNECTION_SECONDS before
+# failing again, the delay resets to _INITIAL_RECONNECT_DELAY_SECONDS instead
+# of continuing to grow - so a connection that's mostly fine but drops every
+# few minutes doesn't end up waiting a full 30s between reconnects.
+_INITIAL_RECONNECT_DELAY_SECONDS = 1.0
+_MAX_RECONNECT_DELAY_SECONDS = 30.0
+_HEALTHY_CONNECTION_SECONDS = 60.0
 
 
 @dataclass
@@ -41,10 +51,13 @@ class ConfigStore:
       Supabase Realtime subscription open on the `subscriptions` table and
       calls set_config() again for the affected master every time a row
       changes (multiplier edited, follower paused/resumed, new subscription
-      added). Runs forever until the process exits; there is no clean
-      shutdown path yet - fine for now since nothing else in this codebase
-      has one either (see TerminalAgent/FollowerAgent .stop(), which only
-      flips a flag).
+      added). Runs forever until the process exits, reconnecting with
+      backoff any time the connection drops (dropped websocket, handshake
+      timeout, etc.) rather than leaving the config cache permanently
+      frozen on whatever was last synced - see _realtime_sync_forever.
+      There is still no clean shutdown path - fine for now since nothing
+      else in this codebase has one either (see TerminalAgent/FollowerAgent
+      .stop(), which only flips a flag).
 
     load_from_file() is kept as-is for local/offline testing without a
     Supabase project configured, per the original isolated-testing README.
@@ -105,7 +118,11 @@ class ConfigStore:
         """One-shot full sync from the `subscriptions` table. Call once at
         backend startup, before agents start dispatching trades, so
         get_followers() never returns stale/empty data for a real master."""
-        response = supabase_client.table("subscriptions").select("*").eq("active", True).execute()
+        from .supabase_client import execute_with_retry
+
+        response = execute_with_retry(
+            lambda: supabase_client.table("subscriptions").select("*").eq("active", True).execute()
+        )
         self._apply_rows(response.data or [])
         logger.info("Loaded %d active subscriptions from Supabase", len(response.data or []))
 
@@ -120,26 +137,55 @@ class ConfigStore:
         return thread
 
     def _run_realtime_loop(self) -> None:
-        try:
-            asyncio.run(self._realtime_sync_coro())
-        except Exception:
-            # A crashed sync thread must not be silent - the backend would
-            # otherwise keep running on a frozen, increasingly stale config
-            # cache with no indication anything is wrong.
-            logger.exception("Supabase realtime config sync crashed - config is now frozen/stale")
-            raise
+        # asyncio.run() itself is only ever entered once - _realtime_sync_forever
+        # is the one that loops, so a dropped connection reconnects instead of
+        # this thread (and asyncio.run) exiting for good.
+        asyncio.run(self._realtime_sync_forever())
+
+    async def _realtime_sync_forever(self) -> None:
+        """Keeps the realtime config-sync connection up for the process
+        lifetime. Previously a single dropped connection (websocket close
+        code 1006, a handshake timeout, etc.) killed this thread for good -
+        get_followers() would then silently keep serving whatever was
+        cached at that moment, forever, with no indication anything was
+        wrong short of the exception in the logs. Now every failure is
+        logged and retried with backoff instead."""
+        delay = _INITIAL_RECONNECT_DELAY_SECONDS
+        while True:
+            started_at = time.monotonic()
+            try:
+                await self._realtime_sync_coro()
+                # _realtime_sync_coro only returns if asyncio.Event().wait()
+                # is cancelled, which nothing does today - reaching here is
+                # unexpected, but still worth reconnecting rather than exiting.
+                logger.warning("Realtime config sync coroutine exited unexpectedly - reconnecting")
+            except Exception:
+                logger.exception(
+                    "Realtime config sync connection lost - config cache stays on "
+                    "last-known values until reconnected"
+                )
+
+            if time.monotonic() - started_at >= _HEALTHY_CONNECTION_SECONDS:
+                delay = _INITIAL_RECONNECT_DELAY_SECONDS
+            else:
+                delay = min(delay * 2, _MAX_RECONNECT_DELAY_SECONDS)
+
+            logger.info("Realtime config sync: reconnecting in %.1fs", delay)
+            await asyncio.sleep(delay)
 
     async def _realtime_sync_coro(self) -> None:
         # Local import: keeps `supabase` an optional dependency for anyone
         # only using load_from_file() for local testing.
-        from .supabase_client import get_async_supabase_client
+        from .supabase_client import async_execute_with_retry, get_async_supabase_client
 
         client = await get_async_supabase_client()
 
         # Full sync before subscribing, so we're not relying on realtime's
         # delivery of every historical row - only on it for *changes* from
         # this point forward.
-        initial = await client.table("subscriptions").select("*").eq("active", True).execute()
+        initial = await async_execute_with_retry(
+            lambda: client.table("subscriptions").select("*").eq("active", True).execute()
+        )
         self._apply_rows(initial.data or [])
         logger.info("Realtime config sync: initial load of %d active subscriptions", len(initial.data or []))
 
@@ -155,12 +201,14 @@ class ConfigStore:
                 logger.warning("Realtime config change with no master_account_id in payload: %s", payload)
                 return
 
-            refreshed = (
-                await client.table("subscriptions")
-                .select("*")
-                .eq("master_account_id", master_account_id)
-                .eq("active", True)
-                .execute()
+            refreshed = await async_execute_with_retry(
+                lambda: (
+                    client.table("subscriptions")
+                    .select("*")
+                    .eq("master_account_id", master_account_id)
+                    .eq("active", True)
+                    .execute()
+                )
             )
             followers = [self._row_to_subscription(row) for row in (refreshed.data or [])]
             self.set_config(master_account_id, followers)

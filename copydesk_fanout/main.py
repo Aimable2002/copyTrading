@@ -41,6 +41,12 @@ from .terminal_agent import TerminalAgent
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("main")
 
+# Supabase's client logs every single HTTP call at INFO - noise, not signal.
+# Our own loggers (main, fanout_core, order_pair_store, config_store) are
+# untouched by this and keep printing normally.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 def _run_local_file_mode(config_path: Path) -> None:
     if not config_path.exists():
@@ -84,7 +90,7 @@ def _run_local_file_mode(config_path: Path) -> None:
 
 def _run_supabase_mode(serve: bool) -> None:
     # Local import: keeps `supabase` an optional dependency for local-file-mode-only use.
-    from .supabase_client import get_supabase_client
+    from .supabase_client import execute_with_retry, get_supabase_client
 
     supabase = get_supabase_client()
 
@@ -97,12 +103,21 @@ def _run_supabase_mode(serve: bool) -> None:
 
     fanout = FanoutCore(config_store, pair_store)
 
-    accounts_response = supabase.table("accounts").select("*").eq("status", "live").execute()
+    # 'paused' accounts still need a running, polled agent - see
+    # account_lifecycle.py's docstring: pausing only flips
+    # subscriptions.active to stop NEW copies, it never stops the agent
+    # itself, so existing open fills keep receiving close/modify/partial
+    # propagation. Only 'live' and 'paused' accounts should have agents
+    # recreated on startup; 'provisioning'/'failed'/'stopped'/'closed'
+    # accounts intentionally do not.
+    accounts_response = execute_with_retry(
+        lambda: supabase.table("accounts").select("*").in_("status", ["live", "paused"]).execute()
+    )
     accounts = accounts_response.data or []
     if not accounts:
         logger.warning(
-            "No accounts with status='live' found in Supabase - nothing to do until the "
-            "provisioning service marks some accounts live."
+            "No accounts with status in ('live', 'paused') found in Supabase - nothing to do "
+            "until the provisioning service marks some accounts live."
         )
 
     agents: list[TerminalAgent] = []
@@ -163,6 +178,7 @@ def _run_agents_with_server(
     import socketio as socketio_lib
     import uvicorn
 
+    from . import billing, profit_share
     from .api_server import create_api_app
     from .live_state_publisher import run_live_state_publisher
     from .socket_server import sio
@@ -180,7 +196,61 @@ def _run_agents_with_server(
         loop = asyncio.get_event_loop()
         while True:
             await asyncio.sleep(interval_seconds)
-            await loop.run_in_executor(None, pair_store.expire_stale_pending)
+            try:
+                await loop.run_in_executor(None, pair_store.expire_stale_pending)
+            except Exception:
+                # A sweep cycle failing (e.g. Supabase connection blip that
+                # outlasted execute_with_retry's own attempts) must never
+                # kill this task - that would cancel the whole gather()
+                # below, taking the API/Socket.IO server down with it. Log
+                # and pick back up on the next interval instead.
+                logger.exception("Stale-pending sweep cycle failed - will retry next interval")
+
+    async def _billing_grace_sweep(interval_seconds: float = 300.0) -> None:
+        """Closes any billing_period past its 5-day grace window. 5 minutes
+        is plenty for a check whose actual threshold is measured in days -
+        no reason to poll this as tightly as the stale-pending sweep,
+        which is cleaning up something that can go wrong within seconds."""
+        loop = asyncio.get_event_loop()
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                await loop.run_in_executor(None, billing.check_grace_expirations, fanout, supabase, agents)
+            except Exception:
+                logger.exception("Billing-grace sweep cycle failed - will retry next interval")
+
+    async def _profit_share_sweep(interval_seconds: float = 60.0) -> None:
+        """Bills newly-closed profitable follower deals. Runs more often
+        than the billing-grace sweep since this is the thing a follower
+        actually sees move (their wallet balance, per the "updated the
+        moment it's touched" requirement) - a full minute of lag between a
+        trade closing and its charge landing is already a compromise
+        against hitting the MT5/EA polling path this hard on every
+        follower, every few seconds."""
+        loop = asyncio.get_event_loop()
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                await loop.run_in_executor(None, lambda: profit_share.run_poll_cycle(fanout=fanout, account_user_map=account_user_map, supabase_client=supabase))
+            except Exception:
+                logger.exception("Profit-share sweep cycle failed - will retry next interval")
+
+    def _log_background_task_result(name: str, task: "asyncio.Task") -> None:
+        """Attached to every background task below. These tasks are meant
+        to loop forever; the only way this callback fires is (a) the task
+        was cancelled (normal shutdown, not an error) or (b) something
+        escaped every try/except inside the loop and killed the task for
+        good. Either way this must only log - it must NEVER re-raise or
+        otherwise touch server.serve(), which is exactly the crash this
+        replaces: previously all these tasks were passed straight into the
+        same asyncio.gather() as server.serve(), so one of them dying took
+        the whole API/Socket.IO server down with it."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("Background task %r exited unexpectedly and will NOT restart automatically - "
+                         "this likely needs a process restart to recover: %r", name, exc, exc_info=exc)
 
     async def _serve_async() -> None:
         port = int(os.environ.get("PORT", "8000"))
@@ -190,11 +260,28 @@ def _run_agents_with_server(
             "API + Socket.IO server listening on 0.0.0.0:%d (POST /accounts/provision, "
             "Socket.IO at /) - point `ngrok http %d` at this port", port, port,
         )
-        publisher_task = asyncio.create_task(
-            run_live_state_publisher(fanout, account_user_map, supabase)
-        )
-        sweep_task = asyncio.create_task(_stale_pending_sweep())
-        await asyncio.gather(server.serve(), publisher_task, sweep_task)
+
+        background = {
+            "live_state_publisher": asyncio.create_task(
+                run_live_state_publisher(fanout, account_user_map, supabase)
+            ),
+            "stale_pending_sweep": asyncio.create_task(_stale_pending_sweep()),
+            "billing_grace_sweep": asyncio.create_task(_billing_grace_sweep()),
+            "profit_share_sweep": asyncio.create_task(_profit_share_sweep()),
+        }
+        for name, task in background.items():
+            task.add_done_callback(lambda t, name=name: _log_background_task_result(name, t))
+
+        try:
+            # Only server.serve() is awaited directly here - a background
+            # task raising can no longer cancel it (see _log_background_task_result
+            # above for why that was happening before). Ctrl+C / SIGTERM
+            # still stops everything via the `finally` below.
+            await server.serve()
+        finally:
+            for task in background.values():
+                task.cancel()
+            await asyncio.gather(*background.values(), return_exceptions=True)
 
     try:
         asyncio.run(_serve_async())

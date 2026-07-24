@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from .supabase_client import execute_with_retry
+
 logger = logging.getLogger("order_pair_store")
 
 
@@ -73,8 +75,12 @@ class OrderPairStore:
             logger.warning("rebuild_from_supabase called with no Supabase client configured - skipping")
             return
 
-        pairs_response = self._supabase.table("order_pairs").select("*").eq("status", "open").execute()
-        pending_response = self._supabase.table("pending_copies").select("*").execute()
+        pairs_response = execute_with_retry(
+            lambda: self._supabase.table("order_pairs").select("*").eq("status", "open").execute()
+        )
+        pending_response = execute_with_retry(
+            lambda: self._supabase.table("pending_copies").select("*").execute()
+        )
 
         with self._lock:
             self._pairs.clear()
@@ -115,9 +121,11 @@ class OrderPairStore:
         if self._supabase is None:
             return
         try:
-            query = self._supabase.table(table).upsert(values, on_conflict=on_conflict) if on_conflict \
-                else self._supabase.table(table).insert(values)
-            query.execute()
+            def _do():
+                query = self._supabase.table(table).upsert(values, on_conflict=on_conflict) if on_conflict \
+                    else self._supabase.table(table).insert(values)
+                return query.execute()
+            execute_with_retry(_do)
         except Exception:
             logger.exception("Supabase write-through to %s failed for %s", table, values)
 
@@ -125,13 +133,15 @@ class OrderPairStore:
         if self._supabase is None:
             return
         try:
-            (
-                self._supabase.table("pending_copies")
-                .delete()
-                .eq("master_account_id", master_account_id)
-                .eq("master_ticket", master_ticket)
-                .eq("follower_account_id", follower_account_id)
-                .execute()
+            execute_with_retry(
+                lambda: (
+                    self._supabase.table("pending_copies")
+                    .delete()
+                    .eq("master_account_id", master_account_id)
+                    .eq("master_ticket", master_ticket)
+                    .eq("follower_account_id", follower_account_id)
+                    .execute()
+                )
             )
         except Exception:
             logger.exception(
@@ -143,13 +153,15 @@ class OrderPairStore:
         if self._supabase is None:
             return
         try:
-            (
-                self._supabase.table("order_pairs")
-                .update({"status": "closed"})
-                .eq("master_account_id", master_account_id)
-                .eq("master_ticket", master_ticket)
-                .eq("follower_account_id", follower_account_id)
-                .execute()
+            execute_with_retry(
+                lambda: (
+                    self._supabase.table("order_pairs")
+                    .update({"status": "closed"})
+                    .eq("master_account_id", master_account_id)
+                    .eq("master_ticket", master_ticket)
+                    .eq("follower_account_id", follower_account_id)
+                    .execute()
+                )
             )
         except Exception:
             logger.exception(
@@ -293,3 +305,14 @@ class OrderPairStore:
                 if fill and fill.ticket == follower_ticket:
                     return master_ticket
             return None
+
+    def get_all_fills_for_follower(self, follower_account_id: str) -> dict[tuple[str, str], FollowerFill]:
+        """Every currently-open pair this follower is part of, keyed by
+        (master_account_id, master_ticket) - used by account_lifecycle.py's
+        force-close-on-pause path."""
+        with self._lock:
+            return {
+                key: followers[follower_account_id]
+                for key, followers in self._pairs.items()
+                if follower_account_id in followers
+            }

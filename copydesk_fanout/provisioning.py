@@ -41,6 +41,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import time
 import uuid
@@ -49,6 +50,7 @@ from typing import Any, Literal
 
 from .fanout_core import FanoutCore
 from .follower_agent import FollowerAgent
+from .supabase_client import execute_with_retry
 from .terminal_agent import TerminalAgent
 
 logger = logging.getLogger("provisioning")
@@ -91,8 +93,38 @@ def _clone_template(account_id: str) -> Path:
         raise ProvisioningError(f"Instance dir already exists: {instance_dir}")
 
     shutil.copytree(template_dir, instance_dir)
+    _lock_terminal_from_updates(instance_dir, os.environ.get("TERMINAL_EXECUTABLE_NAME", "terminal64.exe"))
     logger.info("Cloned template terminal for %s -> %s", account_id, instance_dir)
     return instance_dir
+
+
+def _lock_terminal_from_updates(instance_dir: Path, exe_name: str) -> None:
+    """Marks the terminal binary read-only so MetaQuotes' auto-update can't
+    overwrite it mid-session. This build has no separate updater helper -
+    update logic is baked into the exe itself, downloading a new build to
+    a temp file then swapping it in on restart. Read-only blocks that swap,
+    so the update check fails silently instead of restarting the terminal
+    and killing the running automation."""
+    terminal_exe = instance_dir / exe_name
+    try:
+        os.chmod(terminal_exe, stat.S_IREAD)
+    except OSError as exc:
+        logger.warning("Could not lock %s against updates: %s", terminal_exe, exc)
+
+
+def _unlock_and_remove(instance_dir: Path) -> None:
+    """shutil.rmtree can't delete read-only files on Windows - clear the
+    attribute on anything under instance_dir before removing it, or a
+    failed provisioning attempt leaves an orphaned locked folder behind."""
+    if not instance_dir.exists():
+        return
+    for path in instance_dir.rglob("*"):
+        if path.is_file():
+            try:
+                os.chmod(path, stat.S_IWRITE)
+            except OSError:
+                pass
+    shutil.rmtree(instance_dir, ignore_errors=True)
 
 
 def _write_expert_parameters(instance_dir: Path) -> Path:
@@ -202,7 +234,7 @@ def provision_account(
         config_path = _write_startup_config(
             instance_dir, login=login, password=password, server=server, set_file=set_path
         )
-        _launch_terminal(instance_dir, config_path)
+        launched_process = _launch_terminal(instance_dir, config_path)
 
         metatrader_dir_path = _metatrader_files_path(instance_dir)
 
@@ -221,13 +253,14 @@ def provision_account(
             )
 
         agent.start()
+        agent.terminal_process = launched_process  # noqa: attribute added dynamically - see account_lifecycle.py's close_account
         _wait_until_connected(agent)
 
     except ProvisioningError:
-        shutil.rmtree(instance_dir, ignore_errors=True)
+        _unlock_and_remove(instance_dir)
         raise
     except Exception as exc:  # noqa: BLE001 - any unexpected failure still must not leak a half-built instance
-        shutil.rmtree(instance_dir, ignore_errors=True)
+        _unlock_and_remove(instance_dir)
         raise ProvisioningError(f"Unexpected provisioning failure: {exc}") from exc
 
     # Only touch shared state (fanout registration, Supabase rows) once the
@@ -239,26 +272,30 @@ def provision_account(
     agents.append(agent)
     account_user_map[account_id] = user_id
 
-    supabase_client.table("accounts").insert(
-        {
-            "account_id": account_id,
-            "user_id": user_id,
-            "role": role,
-            "metatrader_dir_path": metatrader_dir_path,
-            "status": "live",
-        }
-    ).execute()
-
-    if role == "follower":
-        supabase_client.table("subscriptions").insert(
+    execute_with_retry(
+        lambda: supabase_client.table("accounts").insert(
             {
-                "master_account_id": master_account_id,
-                "follower_account_id": account_id,
-                "multiplier": multiplier,
-                "sizing_mode": sizing_mode,
-                "active": True,
+                "account_id": account_id,
+                "user_id": user_id,
+                "role": role,
+                "metatrader_dir_path": metatrader_dir_path,
+                "status": "live",
             }
         ).execute()
+    )
+
+    if role == "follower":
+        execute_with_retry(
+            lambda: supabase_client.table("subscriptions").insert(
+                {
+                    "master_account_id": master_account_id,
+                    "follower_account_id": account_id,
+                    "multiplier": multiplier,
+                    "sizing_mode": sizing_mode,
+                    "active": True,
+                }
+            ).execute()
+        )
         # ConfigStore's realtime sync (already running in the background,
         # see config_store.py's start_realtime_sync) picks this row up on
         # its own INSERT listener - no direct config_store call needed here.
