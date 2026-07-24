@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from .config_store import ConfigStore
 from .follower_agent import FollowerAgent
@@ -14,6 +15,15 @@ logger = logging.getLogger("fanout_core")
 # Below this, a partial-close reduction rounds to noise - just skip it
 # rather than send a broker a close command for 0.00 lots.
 _MIN_PARTIAL_CLOSE_LOTS = 0.01
+
+# A ticket can genuinely still show open_price=0 for a brief window right
+# after it's created - the file write can land before MT5 finishes
+# settling the fill. This is a bounded, inline wait for that to clear -
+# NOT a general polling architecture: it only ever runs once per fill, on
+# the follower's own background thread, and gives up after ~2.5s rather
+# than looping forever.
+_PRICE_SETTLE_RETRIES = 5
+_PRICE_SETTLE_RETRY_SECONDS = 0.5
 
 
 class FanoutCore:
@@ -150,9 +160,27 @@ class FanoutCore:
             if follower_agent is None:
                 continue
 
+            # fill.open_price was captured once, in OrderPairStore.confirm_fill,
+            # at the exact instant the follower's order first appeared - which
+            # can itself still be showing a not-yet-settled 0.0 (see
+            # _apply_initial_sl_tp's docstring for why). Prefer whatever the
+            # follower's terminal reports right now; fall back to the cached
+            # value only if the ticket has since closed out of dwx.open_orders.
+            live_follower_order = follower_agent.dwx.open_orders.get(fill.ticket)
+            follower_entry_price = (
+                live_follower_order["open_price"] if live_follower_order and live_follower_order.get("open_price")
+                else fill.open_price
+            )
+            if not follower_entry_price:
+                logger.warning(
+                    "Skipping SL/TP propagation for follower %s#%s - no settled entry price available yet",
+                    follower_account_id, fill.ticket,
+                )
+                continue
+
             follower_sl, follower_tp = apply_sl_tp_distance(
                 order_type=fill.order_type,
-                entry_price=fill.open_price,
+                entry_price=follower_entry_price,
                 sl_distance=sl_distance,
                 tp_distance=tp_distance,
             )
@@ -244,24 +272,56 @@ class FanoutCore:
     def _apply_initial_sl_tp(self, follower_account_id: str, master_ticket: str, follower_ticket: str, follower_order: dict) -> None:
         """
         Called right after a follower's fill is confirmed - applies the
-        master's SL/TP distance to the follower's real fill price. Reads
-        the master's current order state directly off the registered master
-        agent (whichever one has this ticket), since that's simpler and more
-        current than threading the master's order dict through the whole
-        pending/confirm flow.
+        master's SL/TP distance to the follower's real fill price.
+
+        Reads prices from the LIVE dwx.open_orders dict on both agents, not
+        the frozen `follower_order` argument or master_agent._last_orders:
+        both of those are one-time snapshots taken at the instant each
+        ticket first appeared, and can be stuck at open_price=0 for the
+        life of the trade if that first snapshot raced MT5 still settling
+        the fill - dwx.open_orders itself keeps getting refreshed by the
+        agent's own background poll thread and self-corrects within a
+        second or so, we just weren't looking at it.
+
+        If it's still not settled after a short bounded wait, this gives up
+        and skips - no SL/TP this time rather than sending MT5 a garbage
+        price - there's no separate retry scheduled after that; a follower
+        without SL/TP still has the right direction/lots/entry, which is
+        the important part, and any subsequent SL/TP change the master
+        makes will still propagate normally via _fan_out_modify.
         """
         for master_account_id, master_agent in self.master_agents.items():
-            master_order = master_agent._last_orders.get(master_ticket)  # noqa: SLF001 - internal, same module family
+            master_order = master_agent.dwx.open_orders.get(master_ticket)
             if master_order is None:
-                continue
+                continue  # this master doesn't have this ticket - keep looking, or it's genuinely gone already
 
             follower_agent = self.follower_agents.get(follower_account_id)
             if follower_agent is None:
                 return
 
+            master_entry = master_order.get("open_price", 0)
+            follower_entry = 0
+            for _ in range(_PRICE_SETTLE_RETRIES):
+                live_master_order = master_agent.dwx.open_orders.get(master_ticket)
+                live_follower_order = follower_agent.dwx.open_orders.get(follower_ticket)
+                master_entry = live_master_order.get("open_price", 0) if live_master_order else 0
+                follower_entry = live_follower_order.get("open_price", 0) if live_follower_order else 0
+                if master_entry and follower_entry:
+                    master_order = live_master_order
+                    break
+                time.sleep(_PRICE_SETTLE_RETRY_SECONDS)
+            else:
+                logger.warning(
+                    "Follower %s#%s / master#%s never showed a settled entry price after %.1fs - "
+                    "skipping initial SL/TP for this fill",
+                    follower_account_id, follower_ticket, master_ticket,
+                    _PRICE_SETTLE_RETRIES * _PRICE_SETTLE_RETRY_SECONDS,
+                )
+                return
+
             sl_distance, tp_distance = sl_tp_distance(
                 order_type=master_order["type"],
-                entry_price=master_order["open_price"],
+                entry_price=master_entry,
                 sl=master_order.get("SL", 0),
                 tp=master_order.get("TP", 0),
             )
@@ -270,7 +330,7 @@ class FanoutCore:
 
             follower_sl, follower_tp = apply_sl_tp_distance(
                 order_type=follower_order["type"],
-                entry_price=follower_order["open_price"],
+                entry_price=follower_entry,
                 sl_distance=sl_distance,
                 tp_distance=tp_distance,
             )
