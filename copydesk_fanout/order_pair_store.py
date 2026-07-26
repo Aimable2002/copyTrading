@@ -296,6 +296,45 @@ class OrderPairStore:
 
         return expired
 
+    def was_follower_ticket_copied(self, follower_account_id: str, follower_ticket: str) -> bool:
+        """Whether this follower ticket is a confirmed copy of some master
+        signal, ever - checked against the PERSISTED order_pairs table
+        (any status, open or closed), not the in-memory _pairs cache.
+
+        Deliberately different from find_master_ticket_by_follower_ticket()
+        above: that one only searches _pairs, which remove_master_trade()
+        pops the moment a master position closes - so it correctly answers
+        "is there still a live pair to route a modify/close to" for
+        fanout_core.py's use case, but would WRONGLY say "not a copy" for
+        a genuinely-copied trade that has since closed, since by
+        definition it's no longer in that cache. profit_share.py needs the
+        opposite question answered: "was this EVER a real copy, regardless
+        of whether it's still open" - which is exactly what the persisted
+        table (a row per pair, status updated in place, never deleted -
+        see _mark_pair_closed) can answer and the in-memory cache can't.
+
+        Used to gate profit-share billing so a follower's own unrelated
+        manual trades on the same account never get billed as if they were
+        copied - see profit_share.process_follower_deals().
+        """
+        if self._supabase is None:
+            # No persistence configured (e.g. local/offline testing) -
+            # can't verify either way. Fail closed (treat as NOT a copy)
+            # rather than silently billing everything, since unconditional
+            # billing is the exact bug this method exists to prevent.
+            return False
+        response = execute_with_retry(
+            lambda: (
+                self._supabase.table("order_pairs")
+                .select("follower_ticket")
+                .eq("follower_account_id", follower_account_id)
+                .eq("follower_ticket", follower_ticket)
+                .limit(1)
+                .execute()
+            )
+        )
+        return bool(response.data)
+
     def find_master_ticket_by_follower_ticket(self, follower_account_id: str, follower_ticket: str) -> str | None:
         """Used when a follower's copied position gets closed - need to know
         which master trade it belonged to, e.g. for logging/cleanup."""

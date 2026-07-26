@@ -90,13 +90,45 @@ def switch_master(
 
     if existing is not None:
         # Already used this period - free switch, no slot, no rate re-snapshot
-        # (the original snapshot for this slot still applies).
+        # (the original snapshot for this slot still applies)... except that
+        # assumption can be false: if the FIRST time this slot was created,
+        # snapshot_rate_for_copy() raised (master hadn't set a rate yet) after
+        # the roster_slots row had already committed, this slot is left
+        # permanently orphaned - real slot row, no follower_copy_rates row,
+        # ever. That used to mean silent, permanent unbillable trades for
+        # this slot (profit_share.py's poller just logs "no rate snapshot"
+        # forever and skips billing - it never self-heals on its own).
+        # Self-heal here instead: if this slot genuinely has no snapshot,
+        # take one now against whatever rate the master has set AT THIS
+        # MOMENT, rather than assuming one already exists.
+        snapshot = master_rate.get_copy_rate_for_slot(existing["id"], supabase_client)
+        if snapshot is None:
+            logger.warning(
+                "Roster slot %s (follower %s, master %s) has no rate snapshot - self-healing by "
+                "snapshotting the master's current rate now (most likely cause: the master hadn't "
+                "set a rate yet the first time this slot was created)",
+                existing["id"], follower_account_id, new_master_account_id,
+            )
+            master_rate.snapshot_rate_for_copy(
+                follower_account_id=follower_account_id, master_account_id=new_master_account_id,
+                roster_slot_id=existing["id"], supabase_client=supabase_client,
+            )
         _set_current(billing_period_id, follower_account_id, existing["id"], supabase_client)
         logger.info(
             "Follower %s switched back to previously-used master %s (billing_period %s) - no charge",
             follower_account_id, new_master_account_id, billing_period_id,
         )
         return {"master_account_id": new_master_account_id, "roster_slot_id": existing["id"], "charged": False}
+
+    # Confirmed BEFORE any commit or charge below - this is what stops a
+    # brand-new slot from ever ending up orphaned like the case above.
+    # Previously this check only happened implicitly, inside
+    # snapshot_rate_for_copy(), AFTER the roster_slots insert (and after
+    # the slot-purchase wallet debit, if this switch was an overflow) had
+    # already committed - so a master with no rate set left both of those
+    # stuck in place with no way to undo them.
+    if master_rate.get_current_rate(new_master_account_id, supabase_client) is None:
+        raise RosterError(f"Master {new_master_account_id} has not set a rate yet - cannot be copied")
 
     capacity = period["base_roster_size"] + period["purchased_extra_slots"]
     used = len(roster)
@@ -133,6 +165,8 @@ def switch_master(
     )
     new_slot_id = insert_response.data[0]["id"]
 
+    # Guaranteed to succeed now - the rate-exists check above already ran
+    # before this slot (or any charge) was committed.
     rate_snapshot = master_rate.snapshot_rate_for_copy(
         follower_account_id=follower_account_id, master_account_id=new_master_account_id,
         roster_slot_id=new_slot_id, supabase_client=supabase_client,
