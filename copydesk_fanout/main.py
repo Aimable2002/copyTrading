@@ -85,6 +85,15 @@ def _run_local_file_mode(config_path: Path) -> None:
         agents.append(agent)
         logger.info("Registered follower: %s", follower_cfg["account_id"])
 
+    # Local mode has no Supabase-backed pair_store, so expected-open sets are
+    # always empty here - this call won't detect anything "closed while
+    # offline" (there's no persisted prior state to compare against, same
+    # documented limitation as before), but it still seeds each agent's
+    # polling baseline from a real snapshot instead of an empty dict, which
+    # on its own prevents a restart from misreporting already-open local
+    # test trades as new signals.
+    fanout.reconcile_all()
+
     _run_agents(agents)
 
 
@@ -145,6 +154,14 @@ def _run_supabase_mode(serve: bool) -> None:
     # dynamically adding an agent when a new account goes live mid-run
     # (without restarting this process) is the orchestrator piece from the
     # build plan, not yet implemented here.
+
+    # Must run after every master/follower agent above is registered
+    # (reconcile_all() needs the full master_agents/follower_agents maps)
+    # and before _run_agents*/agent.start() below starts the live polling
+    # loops - see FanoutCore.reconcile_all()'s docstring for why ordering
+    # matters here: this is what makes a restart/crash/deploy safe rather
+    # than something that silently loses track of open trades.
+    fanout.reconcile_all()
 
     if serve:
         _run_agents_with_server(agents, fanout, supabase, account_user_map, pair_store)
@@ -328,3 +345,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+    

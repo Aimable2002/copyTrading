@@ -57,6 +57,62 @@ class FanoutCore:
         self.follower_agents.pop(account_id, None)
 
     # ------------------------------------------------------------------ #
+    # Startup reconciliation - crash/restart/deploy recovery
+    # ------------------------------------------------------------------ #
+    def reconcile_all(self) -> None:
+        """Call once at backend startup: AFTER pair_store.rebuild_from_supabase()
+        (so we know what SHOULD be open) and BEFORE any agent.start() (so
+        this runs before the live polling loops begin comparing against a
+        real baseline instead of an empty one - see
+        TerminalAgent.reconcile()'s docstring for the mechanics of why an
+        unseeded baseline is dangerous on its own).
+
+        This is the piece that actually protects against "losing track of
+        an open trade" across a crash or restart:
+
+        Master side is authoritative and acts immediately. If a master
+        position closed while this process was down, the corresponding
+        follower positions are real, live, un-hedged exposure sitting in
+        someone's account with nothing watching it - so those get closed
+        the moment we reconnect, no confirmation step, no delay. If a
+        master position opened while this process was down, it's caught
+        up the same way a live "opened" event would be handled - copied
+        to followers now, late but correct.
+
+        Follower side is seed-only and advisory. We deliberately do NOT
+        auto-reopen a follower ticket that vanished while we were offline
+        - we can't safely tell from here whether that was our own close
+        command finishing, a manual close, or something else, and
+        guessing wrong means placing a real order based on a guess. The
+        master-side pass above is what actually protects the money; this
+        pass just keeps each follower's polling baseline honest (so it
+        doesn't misreport its own already-known positions as new) and
+        logs any drift for a human to check.
+        """
+        for master_account_id, master_agent in self.master_agents.items():
+            expected = self.pair_store.get_open_master_tickets(master_account_id)
+            result = master_agent.reconcile(expected)
+
+            for master_ticket in result.closed_while_offline:
+                logger.warning(
+                    "Auto-closing follower copies of master %s#%s - closed while this process was offline",
+                    master_account_id, master_ticket,
+                )
+                self._fan_out_close(master_account_id, master_ticket)
+
+            for master_ticket in result.new_while_offline:
+                logger.info(
+                    "Catching up on master %s#%s - opened while this process was offline",
+                    master_account_id, master_ticket,
+                )
+                self._fan_out_open(master_account_id, master_ticket, result.live_orders[master_ticket])
+
+        for follower_account_id, follower_agent in self.follower_agents.items():
+            expected = self.pair_store.get_expected_follower_tickets(follower_account_id)
+            follower_agent.reconcile(expected)
+            # No auto-action here by design - see docstring above.
+
+    # ------------------------------------------------------------------ #
     # Master side
     # ------------------------------------------------------------------ #
     def handle_master_trade_event(self, master_account_id: str, event_type: str, ticket: str, order: dict) -> None:

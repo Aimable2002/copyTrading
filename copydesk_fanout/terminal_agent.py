@@ -1,15 +1,30 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
+from dataclasses import dataclass, field
 from typing import Callable, Literal
 
 from .base_agent import BaseAgent
+
+logger = logging.getLogger("terminal_agent")
 
 TradeEventType = Literal["opened", "closed", "modified", "partial_closed"]
 
 # Signature: on_trade_event(account_id, event_type, ticket, order_dict)
 TradeEventCallback = Callable[[str, TradeEventType, str, dict], None]
+
+
+@dataclass
+class ReconciliationResult:
+    """Output of TerminalAgent.reconcile() - what the terminal's real state
+    looked like versus what we expected, at the moment reconciliation ran."""
+
+    matched: set[str] = field(default_factory=set)
+    closed_while_offline: set[str] = field(default_factory=set)
+    new_while_offline: set[str] = field(default_factory=set)
+    live_orders: dict[str, dict] = field(default_factory=dict)  # ticket -> order, straight from the snapshot
 
 # self.dwx.open_orders is kept fresh continuously by dwx_client's own
 # check_open_orders loop (confirmed in its source: it reassigns open_orders
@@ -55,6 +70,76 @@ class TerminalAgent(BaseAgent):
         self._last_full_snapshot: dict[str, dict] = {}
         self._modification_thread: threading.Thread | None = None
         self._modification_thread_running = False
+
+    def reconcile(self, expected_open_tickets: set[str]) -> ReconciliationResult:
+        """Call once at startup - AFTER OrderPairStore.rebuild_from_supabase()
+        so `expected_open_tickets` reflects a real prior-run state, and
+        BEFORE start() begins the live polling loop.
+
+        Without this, both _last_orders (here) and dwx_client's own
+        self.open_orders (see dwx_client.py) start empty on every process
+        boot. The very first read after that would then make every
+        already-open ticket look brand new to on_order_event - which is
+        exactly how a routine restart used to get misreported as a batch
+        of new trade signals, and why some fills would get an
+        _apply_initial_sl_tp pass (because they went through that
+        false-"opened" path) while genuinely pre-existing ones didn't.
+
+        This takes one blocking, non-diffing snapshot read
+        (dwx_client.load_orders() - deliberately NOT check_open_orders(),
+        which is the polling/diffing version that decides whether to fire
+        on_order_event) and reconciles it against expected_open_tickets:
+
+          - in both the snapshot and expected -> matched, nothing to do
+          - in expected but NOT in the snapshot -> closed while this
+            process was down. Dangerous if unnoticed: a follower could be
+            left holding a real position the master no longer has.
+          - in the snapshot but NOT expected -> opened while this process
+            was down (or this is the very first run ever for this ticket).
+
+        Either way, _last_orders/_last_full_snapshot get seeded with the
+        real current snapshot here, so the polling loop that starts right
+        after treats "what's open right now" as the baseline instead of
+        as a wave of new events.
+
+        Deciding what to actually DO about closed_while_offline/
+        new_while_offline is the caller's job (see FanoutCore.reconcile_all)
+        - this method only observes and reports.
+        """
+        self.dwx.load_orders()
+        live = dict(self.dwx.open_orders)
+        live_tickets = set(live.keys())
+
+        matched = live_tickets & expected_open_tickets
+        closed_while_offline = expected_open_tickets - live_tickets
+        new_while_offline = live_tickets - expected_open_tickets
+
+        self._last_orders = dict(live)
+        self._last_full_snapshot = dict(live)
+
+        if closed_while_offline:
+            logger.warning(
+                "[%s] Reconciliation: %d ticket(s) expected open are no longer in the terminal "
+                "(closed while this process was down): %s",
+                self.account_id, len(closed_while_offline), sorted(closed_while_offline),
+            )
+        if new_while_offline:
+            logger.warning(
+                "[%s] Reconciliation: %d ticket(s) are open in the terminal but weren't tracked "
+                "(opened while this process was down, or first-ever run): %s",
+                self.account_id, len(new_while_offline), sorted(new_while_offline),
+            )
+        logger.info(
+            "[%s] Reconciliation complete: %d matched, %d closed-while-offline, %d new-while-offline",
+            self.account_id, len(matched), len(closed_while_offline), len(new_while_offline),
+        )
+
+        return ReconciliationResult(
+            matched=matched,
+            closed_while_offline=closed_while_offline,
+            new_while_offline=new_while_offline,
+            live_orders=live,
+        )
 
     def start(self) -> None:
         super().start()
@@ -105,4 +190,3 @@ class TerminalAgent(BaseAgent):
                 self._on_trade_event(self.account_id, "modified", ticket, order)
 
         self._last_full_snapshot = current
-

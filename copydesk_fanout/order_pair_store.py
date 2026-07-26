@@ -306,6 +306,28 @@ class OrderPairStore:
                     return master_ticket
             return None
 
+    def get_open_master_tickets(self, master_account_id: str) -> set[str]:
+        """All master_ticket values we currently believe are open for this
+        master account, per the in-memory _pairs cache. Call this only
+        after rebuild_from_supabase() has run - that's what makes this
+        reflect Supabase's view rather than an empty just-booted cache.
+        Used by TerminalAgent.reconcile() at startup to detect trades that
+        opened or closed on the master while this process was down."""
+        with self._lock:
+            return {mt for (macc, mt) in self._pairs.keys() if macc == master_account_id}
+
+    def get_expected_follower_tickets(self, follower_account_id: str) -> set[str]:
+        """All follower_ticket values we currently believe are open on this
+        follower account. Same startup-reconciliation use case as
+        get_open_master_tickets, from the follower side."""
+        with self._lock:
+            return {
+                fill.ticket
+                for followers in self._pairs.values()
+                for acc, fill in followers.items()
+                if acc == follower_account_id
+            }
+
     def get_all_fills_for_follower(self, follower_account_id: str) -> dict[tuple[str, str], FollowerFill]:
         """Every currently-open pair this follower is part of, keyed by
         (master_account_id, master_ticket) - used by account_lifecycle.py's
