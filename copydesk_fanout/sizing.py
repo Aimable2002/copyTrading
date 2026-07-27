@@ -40,22 +40,20 @@ def calculate_follower_volume(
       true current risk if their balance has moved a lot since the snapshot.
     """
     if mode == "fixed_multiplier":
-        raw = master_lots * multiplier
-
+        # raw = master_lots * multiplier
+        raw = (follower_balance / master_balance) * master_lots
     elif mode == "balance_proportional":
         if not master_balance or not follower_balance:
             raise ValueError("balance_proportional mode requires both master_balance and follower_balance")
-        raw = (follower_balance / master_balance) * master_lots * multiplier
-
+        raw = (follower_balance / master_balance) * master_lots
     elif mode == "fixed_master_balance_percentage":
         if not fixed_master_balance or not follower_balance:
             raise ValueError(
                 "fixed_master_balance_percentage mode requires both fixed_master_balance and follower_balance"
             )
-        raw = (follower_balance / fixed_master_balance) * master_lots * multiplier
-
+        raw = (follower_balance / fixed_master_balance) * master_lots
     else:
-        raise ValueError(f"Unknown sizing mode: {mode}")
+        assert_never(mode)
 
     # Round to the lot step and enforce a sane minimum.
     stepped = round(raw / _DEFAULT_LOT_STEP) * _DEFAULT_LOT_STEP

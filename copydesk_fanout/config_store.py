@@ -195,7 +195,19 @@ class ConfigStore:
             # to correctly handle DELETE (payload has no useful `record`)
             # and UPDATE-to-inactive (row disappears from an active-only
             # fetch) with one code path.
-            record = payload.get("record") or payload.get("old_record") or {}
+            #
+            # record/old_record are nested inside payload["data"], NOT at
+            # payload's top level - confirmed against a real production
+            # payload: {'data': {..., 'record': {...}, 'old_record': {...}},
+            # 'ids': [...]}. This was wrong before (looked for payload
+            # ["record"] directly) and silently always fell through to {},
+            # which always fired the "no master_account_id in payload"
+            # warning below instead of ever refreshing anything - but that
+            # bug was never actually reachable until the on_change_scheduled
+            # fix (see below) made this function's body run at all, so it
+            # went undetected until a real payload exposed it.
+            data = payload.get("data") or {}
+            record = data.get("record") or data.get("old_record") or {}
             master_account_id = record.get("master_account_id")
             if not master_account_id:
                 logger.warning("Realtime config change with no master_account_id in payload: %s", payload)
@@ -217,10 +229,32 @@ class ConfigStore:
                 master_account_id, len(followers),
             )
 
+        def on_change_scheduled(payload: dict[str, Any]) -> None:
+            # The installed realtime library calls postgres_changes
+            # callbacks synchronously and never awaits them - confirmed
+            # directly against its own source (channel.py's
+            # on_postgres_changes signature is
+            # Callable[[PostgresChangesPayload], None], and the dispatch
+            # site is a bare `postgres_callback(payload)`, no await
+            # anywhere). Registering on_change (an `async def`) directly
+            # as the callback meant every single realtime change produced
+            # a coroutine object that was immediately discarded without
+            # ever running its body - "RuntimeWarning: coroutine ...
+            # on_change was never awaited" is exactly that: the cache was
+            # NEVER updated by a live INSERT/UPDATE/DELETE, only by the
+            # one-time full sync at startup/reconnect. This wrapper is a
+            # genuinely synchronous function (satisfies the library's
+            # actual calling convention) that schedules the real async
+            # work onto the event loop that's already running this
+            # channel's message-processing loop, via create_task - it
+            # doesn't await it directly (this function isn't async), it
+            # just ensures on_change actually gets to run at all.
+            asyncio.create_task(on_change(payload))
+
         channel = client.channel("subscriptions-sync")
-        channel.on_postgres_changes("INSERT", schema="public", table="subscriptions", callback=on_change)
-        channel.on_postgres_changes("UPDATE", schema="public", table="subscriptions", callback=on_change)
-        channel.on_postgres_changes("DELETE", schema="public", table="subscriptions", callback=on_change)
+        channel.on_postgres_changes("INSERT", schema="public", table="subscriptions", callback=on_change_scheduled)
+        channel.on_postgres_changes("UPDATE", schema="public", table="subscriptions", callback=on_change_scheduled)
+        channel.on_postgres_changes("DELETE", schema="public", table="subscriptions", callback=on_change_scheduled)
         await channel.subscribe()
 
         logger.info("Realtime config sync: subscribed to subscriptions table changes")
