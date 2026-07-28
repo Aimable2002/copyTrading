@@ -24,88 +24,21 @@ class ReconciliationResult:
     matched: set[str] = field(default_factory=set)
     closed_while_offline: set[str] = field(default_factory=set)
     new_while_offline: set[str] = field(default_factory=set)
-    live_orders: dict[str, dict] = field(default_factory=dict)  # ticket -> order, straight from the snapshot
+    live_orders: dict[str, dict] = field(default_factory=dict)  
 
-# self.dwx.open_orders is kept fresh continuously by dwx_client's own
-# check_open_orders loop (confirmed in its source: it reassigns open_orders
-# unconditionally on every changed read, then separately decides whether to
-# fire on_order_event - the assignment isn't gated on that decision). So
-# this loop is just re-reading an already-current in-memory dict, not doing
-# its own file I/O - there's no real cost to matching the EA's own ~25ms
-# write cadence rather than polling slower than the data actually changes.
 _MODIFICATION_POLL_SECONDS = 0.03
 
 
 class TerminalAgent(BaseAgent):
-    """
-    Watches one MT5 terminal via DWX Connect and reports opened/closed/
-    modified/partial_closed events.
-
-    Important honesty about the mechanism: NOTHING here is a real push from
-    MT5. The EA writes its state to a file on a 25ms timer (MILLISECOND_TIMER
-    in DWX_Server_MT5.mq5); dwx_client polls that file every ~5ms and updates
-    self.open_orders unconditionally on every changed read. Its on_order_event
-    callback is just dwx_client's own name for "the poll loop noticed a
-    ticket was added or removed" - not an event MT5 pushed to us. Confirmed
-    directly in dwx_client.check_open_orders: self.open_orders is reassigned
-    BEFORE the decision to fire on_order_event is even made.
-
-    Because of that, self.dwx.open_orders is already fresh at ~25ms
-    resolution regardless of whether on_order_event fires. This class runs
-    a second loop at a matching ~30ms interval - not a separate slower
-    "polling fallback", just reading that same already-current dict on a
-    cadence that doesn't add its own lag - specifically to catch SL/TP
-    changes and lot-size reductions on existing tickets, since dwx_client's
-    own diff only checks for keys being added/removed, never for values
-    changing within an existing key.
-    """
-
     def __init__(self, account_id: str, metatrader_dir_path: str, on_trade_event: TradeEventCallback, verbose: bool = True):
         super().__init__(account_id, metatrader_dir_path, verbose=verbose)
         self._on_trade_event = on_trade_event
         self._last_orders: dict[str, dict] = {}
-        # Separate snapshot for the modification-poll thread, decoupled from
-        # _last_orders (which on_order_event updates) so the two detection
-        # paths don't interfere with each other.
         self._last_full_snapshot: dict[str, dict] = {}
         self._modification_thread: threading.Thread | None = None
         self._modification_thread_running = False
 
     def reconcile(self, expected_open_tickets: set[str]) -> ReconciliationResult:
-        """Call once at startup - AFTER OrderPairStore.rebuild_from_supabase()
-        so `expected_open_tickets` reflects a real prior-run state, and
-        BEFORE start() begins the live polling loop.
-
-        Without this, both _last_orders (here) and dwx_client's own
-        self.open_orders (see dwx_client.py) start empty on every process
-        boot. The very first read after that would then make every
-        already-open ticket look brand new to on_order_event - which is
-        exactly how a routine restart used to get misreported as a batch
-        of new trade signals, and why some fills would get an
-        _apply_initial_sl_tp pass (because they went through that
-        false-"opened" path) while genuinely pre-existing ones didn't.
-
-        This takes one blocking, non-diffing snapshot read
-        (dwx_client.load_orders() - deliberately NOT check_open_orders(),
-        which is the polling/diffing version that decides whether to fire
-        on_order_event) and reconciles it against expected_open_tickets:
-
-          - in both the snapshot and expected -> matched, nothing to do
-          - in expected but NOT in the snapshot -> closed while this
-            process was down. Dangerous if unnoticed: a follower could be
-            left holding a real position the master no longer has.
-          - in the snapshot but NOT expected -> opened while this process
-            was down (or this is the very first run ever for this ticket).
-
-        Either way, _last_orders/_last_full_snapshot get seeded with the
-        real current snapshot here, so the polling loop that starts right
-        after treats "what's open right now" as the baseline instead of
-        as a wave of new events.
-
-        Deciding what to actually DO about closed_while_offline/
-        new_while_offline is the caller's job (see FanoutCore.reconcile_all)
-        - this method only observes and reports.
-        """
         self.dwx.load_orders()
         live = dict(self.dwx.open_orders)
         live_tickets = set(live.keys())
@@ -153,6 +86,7 @@ class TerminalAgent(BaseAgent):
 
     def on_order_event(self) -> None:
         current = dict(self.dwx.open_orders)
+        print("DEBUG ON_ORDER_EVENT current :", current)
 
         for ticket, order in current.items():
             if ticket not in self._last_orders:
