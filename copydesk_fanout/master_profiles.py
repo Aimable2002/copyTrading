@@ -56,6 +56,36 @@ def upsert_profile(
     return {"account_id": account_id, "display_name": display_name, "is_public": is_public}
 
 
+def get_own_profile(account_id: str, supabase_client: Any) -> dict | None:
+    """Read this specific master's own profile, regardless of is_public -
+    the counterpart list_public_masters() deliberately doesn't provide,
+    since that one filters to is_public=True at the query level and so
+    can never return a private master's saved data. Ownership is enforced
+    by the caller (api_server.py), same pattern as upsert_profile - this
+    function trusts it's only reached for the account's own owner.
+
+    Returns None if this master has never saved a profile at all (a
+    genuinely blank editor, as opposed to a saved-but-private one)."""
+    response = execute_with_retry(
+        lambda: (
+            supabase_client.table("master_profiles")
+            .select("master_account_id, display_name, bio, is_public")
+            .eq("master_account_id", account_id)
+            .execute()
+        )
+    )
+    rows = response.data or []
+    if not rows:
+        return None
+    row = rows[0]
+    return {
+        "account_id": row["master_account_id"],
+        "display_name": row["display_name"],
+        "bio": row.get("bio"),
+        "is_public": row["is_public"],
+    }
+
+
 def is_public_master(account_id: str, supabase_client: Any) -> bool:
     """Visibility check for the new /masters/{id}/trades route - deliberately
     NOT an ownership check (that's what account_user_map/_resolve_owned_account

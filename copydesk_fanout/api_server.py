@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Literal
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -28,7 +28,12 @@ from .billing import BillingError
 from .fanout_core import FanoutCore
 from .master_profiles import MasterProfileError
 from .master_rate import MasterRateError
-from .provisioning import ProvisioningError, provision_account
+from .provisioning import (
+    ProvisioningError,
+    finalize_provisioned_account,
+    provision_account_finish,
+    provision_account_start,
+)
 from .roster import RosterError
 from .sizing import SizingMode
 from .socket_server import verify_supabase_jwt
@@ -166,19 +171,24 @@ def create_api_app(
         return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
     @app.post("/accounts/provision")
-    def provision(body: ProvisionRequest, authorization: str | None = Header(default=None)):
+    def provision(body: ProvisionRequest, background_tasks: BackgroundTasks, authorization: str | None = Header(default=None)):
         user_id = _authenticate(authorization)
+
+        # Phase 1 runs on the request thread, same ~45s "nice waiting" the
+        # original fully-synchronous version always used for the normal
+        # case - this blocks briefly and returns a real success/error
+        # response, exactly like before. Only the genuinely stalled case
+        # (terminal alive, not yet connected past that window - most
+        # likely needs a human to click "Later" on MT5's LiveUpdate
+        # dialog) gets deferred to a background task below; the common
+        # case never touches BackgroundTasks at all.
         try:
-            account_id = provision_account(
-                user_id=user_id,
+            agent, instance_dir, metatrader_dir_path, outcome, account_id = provision_account_start(
                 role=body.role,
                 login=body.login,
                 password=body.password,
                 server=body.server,
                 fanout=fanout,
-                supabase_client=supabase_client,
-                account_user_map=account_user_map,
-                agents=agents,
                 master_account_id=body.master_account_id,
                 multiplier=body.multiplier,
                 sizing_mode=body.sizing_mode,
@@ -187,7 +197,43 @@ def create_api_app(
             logger.exception("Provisioning failed for user %s", user_id)
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        return {"account_id": account_id, "status": "live"}
+        if outcome == "connected":
+            try:
+                finalize_provisioned_account(
+                    agent, metatrader_dir_path,
+                    user_id=user_id, role=body.role, account_id=account_id, fanout=fanout,
+                    supabase_client=supabase_client, account_user_map=account_user_map, agents=agents,
+                    master_account_id=body.master_account_id, multiplier=body.multiplier, sizing_mode=body.sizing_mode,
+                )
+            except ProvisioningError as exc:
+                logger.exception("Provisioning failed for user %s (account_id %s)", user_id, account_id)
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return {"account_id": account_id, "status": "live"}
+
+        # outcome == "stalled": don't hold the request open for however
+        # long a human might take to notice and click - hand phase 2 off
+        # to a background task and respond right away with a status the
+        # frontend can surface as "needs attention". Resumes and finishes
+        # registration automatically once the terminal connects; see
+        # provision_account_finish() / _wait_stalled() in provisioning.py.
+        def _resume_after_stall() -> None:
+            try:
+                provision_account_finish(
+                    agent, instance_dir, metatrader_dir_path,
+                    user_id=user_id, role=body.role, account_id=account_id, fanout=fanout,
+                    supabase_client=supabase_client, account_user_map=account_user_map, agents=agents,
+                    master_account_id=body.master_account_id, multiplier=body.multiplier, sizing_mode=body.sizing_mode,
+                )
+            except ProvisioningError:
+                # Real, final failure (terminal died mid-wait, or the
+                # max-wait was exceeded) - logged here since there's no
+                # live HTTP request left to turn this into a response for.
+                logger.exception("Provisioning failed for user %s (account_id %s) during stalled wait", user_id, account_id)
+            except Exception:  # noqa: BLE001 - a background task with no caller to reraise to must not die silently
+                logger.exception("Unexpected provisioning failure for user %s (account_id %s) during stalled wait", user_id, account_id)
+
+        background_tasks.add_task(_resume_after_stall)
+        return {"account_id": account_id, "status": "awaiting_attention"}
 
     @app.post("/accounts/{account_id}/pause")
     def pause(account_id: str, body: PauseRequest, authorization: str | None = Header(default=None)):

@@ -48,13 +48,22 @@ def _already_billed(follower_account_id: str, deal_ticket: str, supabase_client:
 
 
 def process_follower_deals(
-    *, follower_account_id: str, billing_period_id: str, agent: Any, supabase_client: Any,
+    *, follower_account_id: str, billing_period_id: str, agent: Any, supabase_client: Any, pair_store: Any,
 ) -> list[dict]:
     """Bills every newly-closed, profitable deal for one follower against
     their current roster slot's locked-in rate. Returns the list of
     charges applied this run (empty if nothing new, or nothing profitable,
     or no current slot at all - e.g. they haven't switched to any master
-    yet this period)."""
+    yet this period).
+
+    pair_store gates this to deals that were actually copied - without it,
+    trade_history.get_account_trade_history() returns literally every deal
+    ever made on this MT5 account, with no distinction between a genuine
+    copy of a master's signal and the follower's own unrelated manual
+    trade on the same account. Both would otherwise get billed identically
+    the moment either closes in profit - a real gap, not a hypothetical
+    one: nothing before this checked that a profitable closed deal had
+    anything to do with copying at all."""
     current_slot = roster.get_current_slot(billing_period_id, follower_account_id, supabase_client)
     if current_slot is None:
         return []
@@ -77,6 +86,16 @@ def process_follower_deals(
         if entry != "out" or pnl <= 0:
             continue
         if _already_billed(follower_account_id, ticket, supabase_client):
+            continue
+        if not pair_store.was_follower_ticket_copied(follower_account_id, ticket):
+            # A real deal, profitable and closed, but never a confirmed
+            # copy of any master signal - the follower's own manual trade
+            # on this account, or a leftover from before they started
+            # copying at all. Not ours to bill.
+            logger.info(
+                "Follower %s deal %s (pnl=%.2f) was never a confirmed copy - not billing it",
+                follower_account_id, ticket, pnl,
+            )
             continue
 
         total_cut = pnl * float(rate["rate_percent"]) / 100
@@ -127,7 +146,8 @@ def run_poll_cycle(*, fanout: Any, account_user_map: dict[str, str], supabase_cl
             if period is None:
                 continue
             charges = process_follower_deals(
-                follower_account_id=account_id, billing_period_id=period["id"], agent=agent, supabase_client=supabase_client,
+                follower_account_id=account_id, billing_period_id=period["id"], agent=agent,
+                supabase_client=supabase_client, pair_store=fanout.pair_store,
             )
             total += len(charges)
         except Exception:

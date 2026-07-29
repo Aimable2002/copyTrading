@@ -1,60 +1,78 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
+from dataclasses import dataclass, field
 from typing import Callable, Literal
 
 from .base_agent import BaseAgent
+
+logger = logging.getLogger("terminal_agent")
 
 TradeEventType = Literal["opened", "closed", "modified", "partial_closed"]
 
 # Signature: on_trade_event(account_id, event_type, ticket, order_dict)
 TradeEventCallback = Callable[[str, TradeEventType, str, dict], None]
 
-# self.dwx.open_orders is kept fresh continuously by dwx_client's own
-# check_open_orders loop (confirmed in its source: it reassigns open_orders
-# unconditionally on every changed read, then separately decides whether to
-# fire on_order_event - the assignment isn't gated on that decision). So
-# this loop is just re-reading an already-current in-memory dict, not doing
-# its own file I/O - there's no real cost to matching the EA's own ~25ms
-# write cadence rather than polling slower than the data actually changes.
+
+@dataclass
+class ReconciliationResult:
+    """Output of TerminalAgent.reconcile() - what the terminal's real state
+    looked like versus what we expected, at the moment reconciliation ran."""
+
+    matched: set[str] = field(default_factory=set)
+    closed_while_offline: set[str] = field(default_factory=set)
+    new_while_offline: set[str] = field(default_factory=set)
+    live_orders: dict[str, dict] = field(default_factory=dict)  
+
 _MODIFICATION_POLL_SECONDS = 0.03
 
 
 class TerminalAgent(BaseAgent):
-    """
-    Watches one MT5 terminal via DWX Connect and reports opened/closed/
-    modified/partial_closed events.
-
-    Important honesty about the mechanism: NOTHING here is a real push from
-    MT5. The EA writes its state to a file on a 25ms timer (MILLISECOND_TIMER
-    in DWX_Server_MT5.mq5); dwx_client polls that file every ~5ms and updates
-    self.open_orders unconditionally on every changed read. Its on_order_event
-    callback is just dwx_client's own name for "the poll loop noticed a
-    ticket was added or removed" - not an event MT5 pushed to us. Confirmed
-    directly in dwx_client.check_open_orders: self.open_orders is reassigned
-    BEFORE the decision to fire on_order_event is even made.
-
-    Because of that, self.dwx.open_orders is already fresh at ~25ms
-    resolution regardless of whether on_order_event fires. This class runs
-    a second loop at a matching ~30ms interval - not a separate slower
-    "polling fallback", just reading that same already-current dict on a
-    cadence that doesn't add its own lag - specifically to catch SL/TP
-    changes and lot-size reductions on existing tickets, since dwx_client's
-    own diff only checks for keys being added/removed, never for values
-    changing within an existing key.
-    """
-
     def __init__(self, account_id: str, metatrader_dir_path: str, on_trade_event: TradeEventCallback, verbose: bool = True):
         super().__init__(account_id, metatrader_dir_path, verbose=verbose)
         self._on_trade_event = on_trade_event
         self._last_orders: dict[str, dict] = {}
-        # Separate snapshot for the modification-poll thread, decoupled from
-        # _last_orders (which on_order_event updates) so the two detection
-        # paths don't interfere with each other.
         self._last_full_snapshot: dict[str, dict] = {}
         self._modification_thread: threading.Thread | None = None
         self._modification_thread_running = False
+
+    def reconcile(self, expected_open_tickets: set[str]) -> ReconciliationResult:
+        self.dwx.load_orders()
+        live = dict(self.dwx.open_orders)
+        live_tickets = set(live.keys())
+
+        matched = live_tickets & expected_open_tickets
+        closed_while_offline = expected_open_tickets - live_tickets
+        new_while_offline = live_tickets - expected_open_tickets
+
+        self._last_orders = dict(live)
+        self._last_full_snapshot = dict(live)
+
+        if closed_while_offline:
+            logger.warning(
+                "[%s] Reconciliation: %d ticket(s) expected open are no longer in the terminal "
+                "(closed while this process was down): %s",
+                self.account_id, len(closed_while_offline), sorted(closed_while_offline),
+            )
+        if new_while_offline:
+            logger.warning(
+                "[%s] Reconciliation: %d ticket(s) are open in the terminal but weren't tracked "
+                "(opened while this process was down, or first-ever run): %s",
+                self.account_id, len(new_while_offline), sorted(new_while_offline),
+            )
+        logger.info(
+            "[%s] Reconciliation complete: %d matched, %d closed-while-offline, %d new-while-offline",
+            self.account_id, len(matched), len(closed_while_offline), len(new_while_offline),
+        )
+
+        return ReconciliationResult(
+            matched=matched,
+            closed_while_offline=closed_while_offline,
+            new_while_offline=new_while_offline,
+            live_orders=live,
+        )
 
     def start(self) -> None:
         super().start()
@@ -68,6 +86,7 @@ class TerminalAgent(BaseAgent):
 
     def on_order_event(self) -> None:
         current = dict(self.dwx.open_orders)
+        print("DEBUG ON_ORDER_EVENT current :", current)
 
         for ticket, order in current.items():
             if ticket not in self._last_orders:
@@ -105,4 +124,3 @@ class TerminalAgent(BaseAgent):
                 self._on_trade_event(self.account_id, "modified", ticket, order)
 
         self._last_full_snapshot = current
-

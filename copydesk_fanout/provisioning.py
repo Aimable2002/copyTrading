@@ -66,6 +66,13 @@ _EA_MAX_LOT_SIZE_OVERRIDE = 100.0
 _CONNECT_TIMEOUT_SECONDS = 45
 _CONNECT_POLL_SECONDS = 1.0
 
+# Second phase, only entered if the terminal process is still alive past
+# _CONNECT_TIMEOUT_SECONDS but hasn't connected yet - the "someone needs to
+# click Later on the LiveUpdate dialog" case. Not a failure by itself; see
+# _wait_fast / _wait_stalled.
+_STALLED_LOG_INTERVAL_SECONDS = 30
+_MAX_STALLED_WAIT_SECONDS = 1800  # 30 min upper bound - last-resort safety net, not a normal expectation
+
 
 class ProvisioningError(Exception):
     """Raised for any provisioning failure. Message is safe to surface to an API caller."""
@@ -93,23 +100,8 @@ def _clone_template(account_id: str) -> Path:
         raise ProvisioningError(f"Instance dir already exists: {instance_dir}")
 
     shutil.copytree(template_dir, instance_dir)
-    _lock_terminal_from_updates(instance_dir, os.environ.get("TERMINAL_EXECUTABLE_NAME", "terminal64.exe"))
     logger.info("Cloned template terminal for %s -> %s", account_id, instance_dir)
     return instance_dir
-
-
-def _lock_terminal_from_updates(instance_dir: Path, exe_name: str) -> None:
-    """Marks the terminal binary read-only so MetaQuotes' auto-update can't
-    overwrite it mid-session. This build has no separate updater helper -
-    update logic is baked into the exe itself, downloading a new build to
-    a temp file then swapping it in on restart. Read-only blocks that swap,
-    so the update check fails silently instead of restarting the terminal
-    and killing the running automation."""
-    terminal_exe = instance_dir / exe_name
-    try:
-        os.chmod(terminal_exe, stat.S_IREAD)
-    except OSError as exc:
-        logger.warning("Could not lock %s against updates: %s", terminal_exe, exc)
 
 
 def _unlock_and_remove(instance_dir: Path) -> None:
@@ -186,56 +178,107 @@ def _metatrader_files_path(instance_dir: Path) -> str:
     return str(instance_dir / "MQL5" / "Files")
 
 
-def _wait_until_connected(agent: TerminalAgent, timeout: float = _CONNECT_TIMEOUT_SECONDS) -> None:
-    """Polls the same is_connected property base_agent.py already exposes
-    (True once the EA has written its first account_info payload)."""
+ConnectOutcome = Literal["connected", "stalled"]
+
+
+def _wait_fast(agent: TerminalAgent, timeout: float = _CONNECT_TIMEOUT_SECONDS) -> ConnectOutcome:
+    """Phase 1 - the normal-case wait, same ~45s window the original
+    synchronous version always used. This is the "nice waiting" for the
+    common case: connects quickly, caller gets a real success response
+    without any background hand-off.
+
+    Returns "connected" or "stalled" (terminal process still alive, just
+    not connected yet within the normal window). Raises ProvisioningError
+    immediately if the process has already died - that's a real, fast
+    failure, handled exactly like before (caller can turn it straight
+    into an HTTP error).
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if agent.is_connected:
-            return
+            return "connected"
         time.sleep(_CONNECT_POLL_SECONDS)
-    raise ProvisioningError(
-        f"Terminal for {agent.account_id} did not report account_info within {timeout}s - "
-        "check the launched terminal directly: bad credentials, AutoTrading off, or the EA "
-        "failed to attach are the three usual causes."
+
+    launched_process: subprocess.Popen | None = getattr(agent, "terminal_process", None)
+    if launched_process is not None and launched_process.poll() is not None:
+        raise ProvisioningError(
+            f"Terminal process for {agent.account_id} exited before connecting (exit code "
+            f"{launched_process.returncode}) - check the launched terminal directly: bad "
+            f"credentials, AutoTrading off, or the EA failed to attach are the three usual causes."
+        )
+    return "stalled"
+
+
+def _wait_stalled(agent: TerminalAgent) -> None:
+    """Phase 2 - only reached after _wait_fast() returns "stalled". Meant
+    to run OFF the request thread (see provision_account_finish /
+    api_server.py's background task) - this is exactly the "someone needs
+    to click Later on MT5's LiveUpdate dialog" case, and can legitimately
+    take a while. Not silent: logs immediately, then again every
+    _STALLED_LOG_INTERVAL_SECONDS, so it's visible in server logs the
+    whole time it's waiting. Bounded by _MAX_STALLED_WAIT_SECONDS as a
+    last-resort safety net, not a normal expectation.
+    """
+    logger.warning(
+        "[%s] Not connected after the normal window - terminal process is still alive, so this "
+        "is NOT being treated as a failure. Waiting for it to connect; will resume automatically.",
+        agent.account_id,
     )
+    stall_start = time.monotonic()
+    last_log = stall_start
+    while True:
+        if agent.is_connected:
+            logger.info(
+                "[%s] Connected after %.0fs stalled wait - resuming provisioning.",
+                agent.account_id, time.monotonic() - stall_start,
+            )
+            return
+        launched_process: subprocess.Popen | None = getattr(agent, "terminal_process", None)
+        if launched_process is not None and launched_process.poll() is not None:
+            raise ProvisioningError(
+                f"Terminal process for {agent.account_id} exited while waiting for human "
+                f"intervention (exit code {launched_process.returncode}) - it was alive moments "
+                f"ago, so this is likely a crash or manual close rather than the original connect timeout."
+            )
+        if time.monotonic() - last_log >= _STALLED_LOG_INTERVAL_SECONDS:
+            logger.warning(
+                "[%s] Still waiting for human admin intervention (%.0fs elapsed, terminal "
+                "process alive, not yet connected).",
+                agent.account_id, time.monotonic() - stall_start,
+            )
+            last_log = time.monotonic()
+        if time.monotonic() - stall_start > _MAX_STALLED_WAIT_SECONDS:
+            raise ProvisioningError(
+                f"Terminal for {agent.account_id} still not connected after "
+                f"{_MAX_STALLED_WAIT_SECONDS:.0f}s of waiting for human intervention - giving up. "
+                f"Terminal process is still alive; check it directly."
+            )
+        time.sleep(_CONNECT_POLL_SECONDS)
 
 
-def provision_account(
-    *,
-    user_id: str,
-    role: Role,
-    login: str,
-    password: str,
-    server: str,
-    fanout: FanoutCore,
-    supabase_client: Any,
-    account_user_map: dict[str, str],
-    agents: list[TerminalAgent],
-    master_account_id: str | None = None,
-    multiplier: float | None = None,
-    sizing_mode: str | None = None,
-) -> str:
-    """
-    End-to-end: credentials in -> running, registered agent + Supabase rows
-    out. Raises ProvisioningError on any failure - the caller (api_server.py)
-    turns that into an HTTP error response. On failure, the cloned instance
-    dir is removed and nothing is registered/written - either this fully
-    succeeds or it leaves no partial state behind.
-    """
-    if role == "follower" and (master_account_id is None or multiplier is None or sizing_mode is None):
-        raise ProvisioningError("follower provisioning requires master_account_id, multiplier, sizing_mode")
+def generate_account_id(role: Role) -> str:
+    """Split out from provision_account so a caller (api_server.py) can
+    generate the id up front and hand it back to the client immediately -
+    needed now that provisioning can genuinely take a while (see
+    _wait_stalled) rather than always finishing within one request."""
+    return f"{role}_{uuid.uuid4().hex[:10]}"
 
-    account_id = f"{role}_{uuid.uuid4().hex[:10]}"
+
+def _start_terminal_and_agent(
+    *, account_id: str, role: Role, login: str, password: str, server: str, fanout: FanoutCore,
+) -> tuple[TerminalAgent, Path, str]:
+    """Clone, write per-account config, launch the terminal, construct and
+    start the agent. Does NOT wait for connection - see _wait_fast /
+    _wait_stalled. On any failure here, cleans up the cloned instance dir
+    and raises ProvisioningError; either this fully succeeds or it leaves
+    no partial state behind."""
     instance_dir = _clone_template(account_id)
-
     try:
         set_path = _write_expert_parameters(instance_dir)
         config_path = _write_startup_config(
             instance_dir, login=login, password=password, server=server, set_file=set_path
         )
         launched_process = _launch_terminal(instance_dir, config_path)
-
         metatrader_dir_path = _metatrader_files_path(instance_dir)
 
         agent: TerminalAgent
@@ -254,8 +297,7 @@ def provision_account(
 
         agent.start()
         agent.terminal_process = launched_process  # noqa: attribute added dynamically - see account_lifecycle.py's close_account
-        _wait_until_connected(agent)
-
+        return agent, instance_dir, metatrader_dir_path
     except ProvisioningError:
         _unlock_and_remove(instance_dir)
         raise
@@ -263,8 +305,27 @@ def provision_account(
         _unlock_and_remove(instance_dir)
         raise ProvisioningError(f"Unexpected provisioning failure: {exc}") from exc
 
-    # Only touch shared state (fanout registration, Supabase rows) once the
-    # terminal is actually confirmed alive - nothing partial gets registered.
+
+def finalize_provisioned_account(
+    agent: TerminalAgent,
+    metatrader_dir_path: str,
+    *,
+    user_id: str,
+    role: Role,
+    account_id: str,
+    fanout: FanoutCore,
+    supabase_client: Any,
+    account_user_map: dict[str, str],
+    agents: list[TerminalAgent],
+    master_account_id: str | None = None,
+    multiplier: float | None = None,
+    sizing_mode: str | None = None,
+) -> None:
+    """Registers into fanout + writes Supabase rows. Only call once the
+    terminal is actually confirmed connected - nothing partial gets
+    registered before that. Public (no leading underscore) because
+    api_server.py calls this directly for the fast/"connected" case
+    instead of going through provision_account_finish()."""
     if role == "master":
         fanout.register_master(agent)
     else:
@@ -301,4 +362,138 @@ def provision_account(
         # its own INSERT listener - no direct config_store call needed here.
 
     logger.info("Provisioned %s account %s for user %s", role, account_id, user_id)
+
+
+def provision_account(
+    *,
+    user_id: str,
+    role: Role,
+    login: str,
+    password: str,
+    server: str,
+    fanout: FanoutCore,
+    supabase_client: Any,
+    account_user_map: dict[str, str],
+    agents: list[TerminalAgent],
+    master_account_id: str | None = None,
+    multiplier: float | None = None,
+    sizing_mode: str | None = None,
+    account_id: str | None = None,
+) -> str:
+    """
+    End-to-end, fully synchronous, including the full (potentially long,
+    human-intervention) wait if the terminal stalls: credentials in ->
+    running, registered agent + Supabase rows out. Raises
+    ProvisioningError on any failure. On failure, the cloned instance dir
+    is removed and nothing is registered/written - either this fully
+    succeeds or it leaves no partial state behind.
+
+    For a caller that needs to respond quickly rather than block through
+    a possibly-long stalled wait (i.e. the HTTP API), use
+    provision_account_start() + provision_account_finish() instead - see
+    api_server.py. This function is what those two are built from
+    underneath, kept as one piece for any other synchronous caller.
+
+    account_id: pass a value already generated via generate_account_id()
+    if the caller needs to know it before this function returns. Generates
+    one internally if not given.
+    """
+    if role == "follower" and (master_account_id is None or multiplier is None or sizing_mode is None):
+        raise ProvisioningError("follower provisioning requires master_account_id, multiplier, sizing_mode")
+
+    account_id = account_id or generate_account_id(role)
+    agent, instance_dir, metatrader_dir_path = _start_terminal_and_agent(
+        account_id=account_id, role=role, login=login, password=password, server=server, fanout=fanout,
+    )
+
+    outcome = _wait_fast(agent)
+    if outcome == "stalled":
+        try:
+            _wait_stalled(agent)
+        except ProvisioningError:
+            _unlock_and_remove(instance_dir)
+            raise
+
+    finalize_provisioned_account(
+        agent, metatrader_dir_path,
+        user_id=user_id, role=role, account_id=account_id, fanout=fanout,
+        supabase_client=supabase_client, account_user_map=account_user_map, agents=agents,
+        master_account_id=master_account_id, multiplier=multiplier, sizing_mode=sizing_mode,
+    )
     return account_id
+
+
+def provision_account_start(
+    *,
+    role: Role,
+    login: str,
+    password: str,
+    server: str,
+    fanout: FanoutCore,
+    master_account_id: str | None = None,
+    multiplier: float | None = None,
+    sizing_mode: str | None = None,
+    account_id: str | None = None,
+) -> tuple[TerminalAgent, Path, str, ConnectOutcome, str]:
+    """Phase 1, for callers (api_server.py) that need to respond to an HTTP
+    request quickly instead of blocking through a possibly-long stalled
+    wait. Runs clone/launch/agent-start/normal-window wait only - the
+    same ~45s "nice waiting" provision_account() always used for the
+    common case. Still validates follower args and still raises
+    ProvisioningError immediately (a real, fast failure, same as before)
+    if the process died within that window.
+
+    Returns (agent, instance_dir, metatrader_dir_path, outcome, account_id)
+    so the caller can respond "live" right away if outcome == "connected"
+    (via finalize_provisioned_account()), or "awaiting_attention" if
+    outcome == "stalled" and hand the rest off to provision_account_finish()
+    in a background task.
+    """
+    if role == "follower" and (master_account_id is None or multiplier is None or sizing_mode is None):
+        raise ProvisioningError("follower provisioning requires master_account_id, multiplier, sizing_mode")
+
+    account_id = account_id or generate_account_id(role)
+    agent, instance_dir, metatrader_dir_path = _start_terminal_and_agent(
+        account_id=account_id, role=role, login=login, password=password, server=server, fanout=fanout,
+    )
+    outcome = _wait_fast(agent)
+    return agent, instance_dir, metatrader_dir_path, outcome, account_id
+
+
+def provision_account_finish(
+    agent: TerminalAgent,
+    instance_dir: Path,
+    metatrader_dir_path: str,
+    *,
+    user_id: str,
+    role: Role,
+    account_id: str,
+    fanout: FanoutCore,
+    supabase_client: Any,
+    account_user_map: dict[str, str],
+    agents: list[TerminalAgent],
+    master_account_id: str | None = None,
+    multiplier: float | None = None,
+    sizing_mode: str | None = None,
+) -> None:
+    """Phase 2 - call only when provision_account_start() returned
+    outcome == "stalled". Meant to run in a background task: waits
+    (potentially a long time) for a human to resolve whatever's blocking
+    the terminal, then finalizes registration exactly like
+    provision_account()'s tail does. Raises ProvisioningError if the
+    terminal dies during the wait or the max-wait is exceeded - there's no
+    live HTTP request left at that point, so the caller (api_server.py) is
+    responsible for logging it rather than turning it into a response.
+    """
+    try:
+        _wait_stalled(agent)
+    except ProvisioningError:
+        _unlock_and_remove(instance_dir)
+        raise
+
+    finalize_provisioned_account(
+        agent, metatrader_dir_path,
+        user_id=user_id, role=role, account_id=account_id, fanout=fanout,
+        supabase_client=supabase_client, account_user_map=account_user_map, agents=agents,
+        master_account_id=master_account_id, multiplier=multiplier, sizing_mode=sizing_mode,
+    )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from .config_store import ConfigStore
 from .follower_agent import FollowerAgent
@@ -14,6 +15,15 @@ logger = logging.getLogger("fanout_core")
 # Below this, a partial-close reduction rounds to noise - just skip it
 # rather than send a broker a close command for 0.00 lots.
 _MIN_PARTIAL_CLOSE_LOTS = 0.01
+
+# A ticket can genuinely still show open_price=0 for a brief window right
+# after it's created - the file write can land before MT5 finishes
+# settling the fill. This is a bounded, inline wait for that to clear -
+# NOT a general polling architecture: it only ever runs once per fill, on
+# the follower's own background thread, and gives up after ~2.5s rather
+# than looping forever.
+_PRICE_SETTLE_RETRIES = 5
+_PRICE_SETTLE_RETRY_SECONDS = 0.5
 
 
 class FanoutCore:
@@ -45,6 +55,62 @@ class FanoutCore:
 
     def unregister_follower(self, account_id: str) -> None:
         self.follower_agents.pop(account_id, None)
+
+    # ------------------------------------------------------------------ #
+    # Startup reconciliation - crash/restart/deploy recovery
+    # ------------------------------------------------------------------ #
+    def reconcile_all(self) -> None:
+        """Call once at backend startup: AFTER pair_store.rebuild_from_supabase()
+        (so we know what SHOULD be open) and BEFORE any agent.start() (so
+        this runs before the live polling loops begin comparing against a
+        real baseline instead of an empty one - see
+        TerminalAgent.reconcile()'s docstring for the mechanics of why an
+        unseeded baseline is dangerous on its own).
+
+        This is the piece that actually protects against "losing track of
+        an open trade" across a crash or restart:
+
+        Master side is authoritative and acts immediately. If a master
+        position closed while this process was down, the corresponding
+        follower positions are real, live, un-hedged exposure sitting in
+        someone's account with nothing watching it - so those get closed
+        the moment we reconnect, no confirmation step, no delay. If a
+        master position opened while this process was down, it's caught
+        up the same way a live "opened" event would be handled - copied
+        to followers now, late but correct.
+
+        Follower side is seed-only and advisory. We deliberately do NOT
+        auto-reopen a follower ticket that vanished while we were offline
+        - we can't safely tell from here whether that was our own close
+        command finishing, a manual close, or something else, and
+        guessing wrong means placing a real order based on a guess. The
+        master-side pass above is what actually protects the money; this
+        pass just keeps each follower's polling baseline honest (so it
+        doesn't misreport its own already-known positions as new) and
+        logs any drift for a human to check.
+        """
+        for master_account_id, master_agent in self.master_agents.items():
+            expected = self.pair_store.get_open_master_tickets(master_account_id)
+            result = master_agent.reconcile(expected)
+
+            for master_ticket in result.closed_while_offline:
+                logger.warning(
+                    "Auto-closing follower copies of master %s#%s - closed while this process was offline",
+                    master_account_id, master_ticket,
+                )
+                self._fan_out_close(master_account_id, master_ticket)
+
+            for master_ticket in result.new_while_offline:
+                logger.info(
+                    "Catching up on master %s#%s - opened while this process was offline",
+                    master_account_id, master_ticket,
+                )
+                self._fan_out_open(master_account_id, master_ticket, result.live_orders[master_ticket])
+
+        for follower_account_id, follower_agent in self.follower_agents.items():
+            expected = self.pair_store.get_expected_follower_tickets(follower_account_id)
+            follower_agent.reconcile(expected)
+            # No auto-action here by design - see docstring above.
 
     # ------------------------------------------------------------------ #
     # Master side
@@ -150,9 +216,27 @@ class FanoutCore:
             if follower_agent is None:
                 continue
 
+            # fill.open_price was captured once, in OrderPairStore.confirm_fill,
+            # at the exact instant the follower's order first appeared - which
+            # can itself still be showing a not-yet-settled 0.0 (see
+            # _apply_initial_sl_tp's docstring for why). Prefer whatever the
+            # follower's terminal reports right now; fall back to the cached
+            # value only if the ticket has since closed out of dwx.open_orders.
+            live_follower_order = follower_agent.dwx.open_orders.get(fill.ticket)
+            follower_entry_price = (
+                live_follower_order["open_price"] if live_follower_order and live_follower_order.get("open_price")
+                else fill.open_price
+            )
+            if not follower_entry_price:
+                logger.warning(
+                    "Skipping SL/TP propagation for follower %s#%s - no settled entry price available yet",
+                    follower_account_id, fill.ticket,
+                )
+                continue
+
             follower_sl, follower_tp = apply_sl_tp_distance(
                 order_type=fill.order_type,
-                entry_price=fill.open_price,
+                entry_price=follower_entry_price,
                 sl_distance=sl_distance,
                 tp_distance=tp_distance,
             )
@@ -244,24 +328,56 @@ class FanoutCore:
     def _apply_initial_sl_tp(self, follower_account_id: str, master_ticket: str, follower_ticket: str, follower_order: dict) -> None:
         """
         Called right after a follower's fill is confirmed - applies the
-        master's SL/TP distance to the follower's real fill price. Reads
-        the master's current order state directly off the registered master
-        agent (whichever one has this ticket), since that's simpler and more
-        current than threading the master's order dict through the whole
-        pending/confirm flow.
+        master's SL/TP distance to the follower's real fill price.
+
+        Reads prices from the LIVE dwx.open_orders dict on both agents, not
+        the frozen `follower_order` argument or master_agent._last_orders:
+        both of those are one-time snapshots taken at the instant each
+        ticket first appeared, and can be stuck at open_price=0 for the
+        life of the trade if that first snapshot raced MT5 still settling
+        the fill - dwx.open_orders itself keeps getting refreshed by the
+        agent's own background poll thread and self-corrects within a
+        second or so, we just weren't looking at it.
+
+        If it's still not settled after a short bounded wait, this gives up
+        and skips - no SL/TP this time rather than sending MT5 a garbage
+        price - there's no separate retry scheduled after that; a follower
+        without SL/TP still has the right direction/lots/entry, which is
+        the important part, and any subsequent SL/TP change the master
+        makes will still propagate normally via _fan_out_modify.
         """
         for master_account_id, master_agent in self.master_agents.items():
-            master_order = master_agent._last_orders.get(master_ticket)  # noqa: SLF001 - internal, same module family
+            master_order = master_agent.dwx.open_orders.get(master_ticket)
             if master_order is None:
-                continue
+                continue  # this master doesn't have this ticket - keep looking, or it's genuinely gone already
 
             follower_agent = self.follower_agents.get(follower_account_id)
             if follower_agent is None:
                 return
 
+            master_entry = master_order.get("open_price", 0)
+            follower_entry = 0
+            for _ in range(_PRICE_SETTLE_RETRIES):
+                live_master_order = master_agent.dwx.open_orders.get(master_ticket)
+                live_follower_order = follower_agent.dwx.open_orders.get(follower_ticket)
+                master_entry = live_master_order.get("open_price", 0) if live_master_order else 0
+                follower_entry = live_follower_order.get("open_price", 0) if live_follower_order else 0
+                if master_entry and follower_entry:
+                    master_order = live_master_order
+                    break
+                time.sleep(_PRICE_SETTLE_RETRY_SECONDS)
+            else:
+                logger.warning(
+                    "Follower %s#%s / master#%s never showed a settled entry price after %.1fs - "
+                    "skipping initial SL/TP for this fill",
+                    follower_account_id, follower_ticket, master_ticket,
+                    _PRICE_SETTLE_RETRIES * _PRICE_SETTLE_RETRY_SECONDS,
+                )
+                return
+
             sl_distance, tp_distance = sl_tp_distance(
                 order_type=master_order["type"],
-                entry_price=master_order["open_price"],
+                entry_price=master_entry,
                 sl=master_order.get("SL", 0),
                 tp=master_order.get("TP", 0),
             )
@@ -270,7 +386,7 @@ class FanoutCore:
 
             follower_sl, follower_tp = apply_sl_tp_distance(
                 order_type=follower_order["type"],
-                entry_price=follower_order["open_price"],
+                entry_price=follower_entry,
                 sl_distance=sl_distance,
                 tp_distance=tp_distance,
             )
