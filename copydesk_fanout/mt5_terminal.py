@@ -276,7 +276,7 @@ def _worker_main(
     process, attached to its own already-running terminal at
     instance_dir/terminal64.exe (see provisioning.py's _launch_terminal).
     """
-    import MetaTrader5 as mt5  # imported here, not module-level - only the worker process needs it
+    import MetaTrader5 as mt5  
 
     ok = mt5.initialize(path=terminal_path, login=login, password=password, server=server, portable=True)
     state["connected"] = bool(ok)
@@ -326,7 +326,8 @@ def _handle_command(mt5_module, cmd_type: str, payload: dict) -> dict:
         from datetime import datetime, timedelta, timezone
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=payload["lookback_days"])
-        deals = mt5_module.history_deals_get(start, end)
+        deals = mt5_module.history_deals_get(start, end)  # i suspect that this line is wrong it maybe suppose to take 3 parameters
+        print(" deals :", deals)
         return {"historic_trades": deals_to_historic_trades(deals)}
     return {"error": f"unknown command type: {cmd_type}"}
 

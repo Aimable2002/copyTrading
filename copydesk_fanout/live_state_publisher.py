@@ -69,6 +69,7 @@ def _build_state(agent: BaseAgent) -> dict[str, Any]:
 
 def _write_live_state_row(supabase_client: Any, account_id: str, state: dict[str, Any]) -> None:
     try:
+        print(" writing state data to db ===============")
         execute_with_retry(
             lambda: supabase_client.table("live_account_state").upsert(
                 {
@@ -81,9 +82,6 @@ def _write_live_state_row(supabase_client: Any, account_id: str, state: dict[str
             ).execute()
         )
     except Exception:
-        # Still never raise into the publisher loop - this is a display
-        # cache write (see module docstring), not the hot trading path.
-        # Losing one tick's row is fine; crashing the publisher task is not.
         logger.exception("Failed to write live_account_state row for %s", account_id)
 
 
@@ -118,14 +116,8 @@ async def run_live_state_publisher(
                     await emit_account_state(user_id, account_id, state)
                 except Exception:
                     logger.exception("Socket emit failed for account %s", account_id)
-
-                # Supabase write is a blocking network call - offload it so it
-                # can't stall the emit loop for every other account this tick.
                 await loop.run_in_executor(None, _write_live_state_row, supabase_client, account_id, state)
             except Exception:
-                # One account's tick failing (bad data, unexpected attribute
-                # error, etc.) must not stop every other account from being
-                # published this tick, and must not kill the publisher task.
                 logger.exception("Live-state publish tick failed for account %s", account_id)
 
         await asyncio.sleep(interval_seconds)
