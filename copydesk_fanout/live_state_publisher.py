@@ -16,7 +16,7 @@ actually owns the websocket connections, and lets the Supabase write use
 run_in_executor so a slow network call never blocks the loop that's also
 serving other agents' emits.
 
-Reads agent.balance / agent.dwx.open_orders directly (see base_agent.py) -
+Reads agent.balance / agent.terminal.open_orders directly (see base_agent.py) -
 these are the same in-memory attributes TerminalAgent/FollowerAgent already
 maintain from DWX Connect's file polling, no new I/O against MT5 added
 here. account_id -> user_id mapping comes from the `accounts` table, fetched
@@ -44,7 +44,7 @@ DEFAULT_INTERVAL_SECONDS = 1.0  # throttled on purpose - this is a display refre
 
 def _serialize_open_positions(agent: BaseAgent) -> list[dict[str, Any]]:
     positions = []
-    for order_id, order in agent.dwx.open_orders.items():
+    for order_id, order in agent.terminal.open_orders.items():
         positions.append(
             {
                 "ticket": order_id,
@@ -61,8 +61,8 @@ def _serialize_open_positions(agent: BaseAgent) -> list[dict[str, Any]]:
 
 def _build_state(agent: BaseAgent) -> dict[str, Any]:
     return {
-        "balance": agent.dwx.account_info.get("balance"),
-        "equity": agent.dwx.account_info.get("equity"),
+        "balance": agent.terminal.account_info.get("balance"),
+        "equity": agent.terminal.account_info.get("equity"),
         "open_positions": _serialize_open_positions(agent),
     }
 
@@ -105,7 +105,7 @@ async def run_live_state_publisher(
         for account_id, agent in agents.items():
             try:
                 if not agent.is_connected:
-                    continue  # EA hasn't written a first account_info payload yet - nothing to publish
+                    continue  
 
                 user_id = account_user_map.get(account_id)
                 if not user_id:

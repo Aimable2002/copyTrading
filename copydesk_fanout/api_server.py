@@ -183,7 +183,7 @@ def create_api_app(
         # dialog) gets deferred to a background task below; the common
         # case never touches BackgroundTasks at all.
         try:
-            agent, instance_dir, metatrader_dir_path, outcome, account_id = provision_account_start(
+            agent, instance_dir, terminal_path, outcome, account_id = provision_account_start(
                 role=body.role,
                 login=body.login,
                 password=body.password,
@@ -200,9 +200,10 @@ def create_api_app(
         if outcome == "connected":
             try:
                 finalize_provisioned_account(
-                    agent, metatrader_dir_path,
-                    user_id=user_id, role=body.role, account_id=account_id, fanout=fanout,
-                    supabase_client=supabase_client, account_user_map=account_user_map, agents=agents,
+                    agent, terminal_path,
+                    user_id=user_id, role=body.role, account_id=account_id,
+                    fanout=fanout, supabase_client=supabase_client,
+                    account_user_map=account_user_map, agents=agents,
                     master_account_id=body.master_account_id, multiplier=body.multiplier, sizing_mode=body.sizing_mode,
                 )
             except ProvisioningError as exc:
@@ -219,9 +220,10 @@ def create_api_app(
         def _resume_after_stall() -> None:
             try:
                 provision_account_finish(
-                    agent, instance_dir, metatrader_dir_path,
-                    user_id=user_id, role=body.role, account_id=account_id, fanout=fanout,
-                    supabase_client=supabase_client, account_user_map=account_user_map, agents=agents,
+                    agent, instance_dir, terminal_path,
+                    user_id=user_id, role=body.role, account_id=account_id,
+                    fanout=fanout, supabase_client=supabase_client,
+                    account_user_map=account_user_map, agents=agents,
                     master_account_id=body.master_account_id, multiplier=body.multiplier, sizing_mode=body.sizing_mode,
                 )
             except ProvisioningError:

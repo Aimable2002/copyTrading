@@ -5,6 +5,7 @@ import time
 
 from .config_store import ConfigStore
 from .follower_agent import FollowerAgent
+from .mt5_terminal import OrderCapExceeded
 from .order_pair_store import OrderPairStore
 from .sizing import calculate_follower_volume
 from .sltp import apply_sl_tp_distance, sl_tp_distance
@@ -29,7 +30,7 @@ _PRICE_SETTLE_RETRY_SECONDS = 0.5
 class FanoutCore:
     """
     The actual new logic this whole build was for. Everything else
-    (DWX Connect, the sizing formulas) is reused; this class is what
+    (native MT5 execution via Mt5Terminal, the sizing formulas) is reused; this class is what
     connects them: master trade detected -> per-follower size computed ->
     dispatched -> pairing tracked so later closes/modifies/partial-closes on
     the master propagate to the right follower tickets.
@@ -105,7 +106,7 @@ class FanoutCore:
                     "Catching up on master %s#%s - opened while this process was offline",
                     master_account_id, master_ticket,
                 )
-                self._fan_out_open(master_account_id, master_ticket, result.live_orders[master_ticket])
+                # self._fan_out_open(master_account_id, master_ticket, result.live_orders[master_ticket])  this line is dangerous never uncomment this line or ....
 
         for follower_account_id, follower_agent in self.follower_agents.items():
             expected = self.pair_store.get_expected_follower_tickets(follower_account_id)
@@ -163,15 +164,31 @@ class FanoutCore:
 
             self.pair_store.add_pending(master_account_id, master_ticket, sub.follower_account_id, dispatched_lots=lots)
             # SL/TP intentionally NOT passed here (0/0 - open cleanly first).
-            # We don't know the follower's real fill price yet (DWX Connect's
-            # bridge is async), so distance-based SL/TP is computed and
+            # order_send() is synchronous now, but the fill still isn't
+            # necessarily reflected in positions_get() the instant this
+            # call returns - distance-based SL/TP is still computed and
             # applied once the fill is confirmed - see handle_follower_trade_event.
-            follower_agent.execute_open(
-                master_ticket=master_ticket,
-                symbol=master_order["symbol"],
-                order_type=master_order["type"],
-                lots=lots,
-            )
+            try:
+                result = follower_agent.execute_open(
+                    master_ticket=master_ticket,
+                    symbol=master_order["symbol"],
+                    order_type=master_order["type"],
+                    lots=lots,
+                )
+            except OrderCapExceeded:
+                logger.exception(
+                    "Follower %s hit its order cap - skipping this copy, other followers unaffected",
+                    sub.follower_account_id,
+                )
+                continue
+
+            if not result.get("success"):
+                logger.warning(
+                    "order_send rejected for follower %s: retcode=%s comment=%s",
+                    sub.follower_account_id, result.get("retcode"), result.get("comment"),
+                )
+                continue
+
             logger.info(
                 "Dispatched copy: master %s#%s -> follower %s, %.2f lots",
                 master_account_id, master_ticket, sub.follower_account_id, lots,
@@ -216,13 +233,7 @@ class FanoutCore:
             if follower_agent is None:
                 continue
 
-            # fill.open_price was captured once, in OrderPairStore.confirm_fill,
-            # at the exact instant the follower's order first appeared - which
-            # can itself still be showing a not-yet-settled 0.0 (see
-            # _apply_initial_sl_tp's docstring for why). Prefer whatever the
-            # follower's terminal reports right now; fall back to the cached
-            # value only if the ticket has since closed out of dwx.open_orders.
-            live_follower_order = follower_agent.dwx.open_orders.get(fill.ticket)
+            live_follower_order = follower_agent.terminal.open_orders.get(fill.ticket)
             follower_entry_price = (
                 live_follower_order["open_price"] if live_follower_order and live_follower_order.get("open_price")
                 else fill.open_price
@@ -347,7 +358,7 @@ class FanoutCore:
         makes will still propagate normally via _fan_out_modify.
         """
         for master_account_id, master_agent in self.master_agents.items():
-            master_order = master_agent.dwx.open_orders.get(master_ticket)
+            master_order = master_agent.terminal.open_orders.get(master_ticket)
             if master_order is None:
                 continue  # this master doesn't have this ticket - keep looking, or it's genuinely gone already
 
@@ -358,8 +369,8 @@ class FanoutCore:
             master_entry = master_order.get("open_price", 0)
             follower_entry = 0
             for _ in range(_PRICE_SETTLE_RETRIES):
-                live_master_order = master_agent.dwx.open_orders.get(master_ticket)
-                live_follower_order = follower_agent.dwx.open_orders.get(follower_ticket)
+                live_master_order = master_agent.terminal.open_orders.get(master_ticket)
+                live_follower_order = follower_agent.terminal.open_orders.get(follower_ticket)
                 master_entry = live_master_order.get("open_price", 0) if live_master_order else 0
                 follower_entry = live_follower_order.get("open_price", 0) if live_follower_order else 0
                 if master_entry and follower_entry:

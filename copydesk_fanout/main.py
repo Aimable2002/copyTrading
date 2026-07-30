@@ -19,9 +19,10 @@ Two modes, chosen automatically by --config vs --supabase:
     so an open copied trade survives a backend restart.
 
 Regardless of mode: each master/follower account must already be logged
-into its own running MT5 terminal with DWX_Server_MT5.mq5 attached to a
-chart (per the official dwxconnect README, or done automatically by the
-provisioning service in Supabase mode) before starting this.
+into its own running MT5 terminal with AutoTrading on (done automatically
+by the provisioning service - see provisioning.py). No EA/chart attachment
+needed anymore - execution and state both go through the native MT5
+connection (see mt5_terminal.py), not a file bridge.
 """
 
 from __future__ import annotations
@@ -68,7 +69,10 @@ def _run_local_file_mode(config_path: Path) -> None:
     for master_cfg in raw["accounts"]["masters"]:
         agent = TerminalAgent(
             account_id=master_cfg["account_id"],
-            metatrader_dir_path=master_cfg["metatrader_dir_path"],
+            terminal_path=master_cfg["terminal_path"],
+            login=master_cfg["login"],
+            password=master_cfg["password"],
+            server=master_cfg["server"],
             on_trade_event=fanout.handle_master_trade_event,
         )
         fanout.register_master(agent)
@@ -78,7 +82,10 @@ def _run_local_file_mode(config_path: Path) -> None:
     for follower_cfg in raw["accounts"]["followers"]:
         agent = FollowerAgent(
             account_id=follower_cfg["account_id"],
-            metatrader_dir_path=follower_cfg["metatrader_dir_path"],
+            terminal_path=follower_cfg["terminal_path"],
+            login=follower_cfg["login"],
+            password=follower_cfg["password"],
+            server=follower_cfg["server"],
             on_trade_event=fanout.handle_follower_trade_event,
         )
         fanout.register_follower(agent)
@@ -100,6 +107,7 @@ def _run_local_file_mode(config_path: Path) -> None:
 def _run_supabase_mode(serve: bool) -> None:
     # Local import: keeps `supabase` an optional dependency for local-file-mode-only use.
     from .supabase_client import execute_with_retry, get_supabase_client
+    from .provisioning import read_provisioned_credentials
 
     supabase = get_supabase_client()
 
@@ -133,17 +141,37 @@ def _run_supabase_mode(serve: bool) -> None:
     account_user_map: dict[str, str] = {}
     for account in accounts:
         account_user_map[account["account_id"]] = account["user_id"]
+
+        # Credentials are never read from Supabase, by design - only
+        # terminal_path is persisted there. login/password/server live
+        # exclusively in provisioned_config.ini next to the terminal
+        # itself (see provisioning.py's _write_startup_config /
+        # read_provisioned_credentials), recovered here from disk on
+        # every restart instead.
+        # Column name unchanged (metatrader_dir_path, no frontend impact) -
+        # only what it now points at changed: terminal64.exe, not the old
+        # MQL5/Files folder.
+        terminal_path = account["metatrader_dir_path"]
+        instance_dir = Path(terminal_path).parent
+        login, password, server = read_provisioned_credentials(instance_dir)
+
         if account["role"] == "master":
             agent = TerminalAgent(
                 account_id=account["account_id"],
-                metatrader_dir_path=account["metatrader_dir_path"],
+                terminal_path=terminal_path,
+                login=login,
+                password=password,
+                server=server,
                 on_trade_event=fanout.handle_master_trade_event,
             )
             fanout.register_master(agent)
         else:
             agent = FollowerAgent(
                 account_id=account["account_id"],
-                metatrader_dir_path=account["metatrader_dir_path"],
+                terminal_path=terminal_path,
+                login=login,
+                password=password,
+                server=server,
                 on_trade_event=fanout.handle_follower_trade_event,
             )
             fanout.register_follower(agent)
@@ -345,5 +373,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-    
