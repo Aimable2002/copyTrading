@@ -128,6 +128,7 @@ class FanoutCore:
 
     def _fan_out_open(self, master_account_id: str, master_ticket: str, master_order: dict) -> None:
         master_agent = self.master_agents.get(master_account_id)
+        print(" debugging masters order :", master_order)
         if master_agent is None:
             logger.warning("Trade event for unknown master account %s", master_account_id)
             return
