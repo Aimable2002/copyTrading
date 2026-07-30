@@ -126,8 +126,8 @@ def deal_to_historic_trade_dict(deal: Any) -> dict:
         "symbol": deal.symbol,
         "lots": round(deal.volume, 2),
         "type": position_type_to_str(deal.type),
-        "entry": deal.entry,  # native int (DEAL_ENTRY_IN=0/OUT=1) - trade_history.py's ENTRY_MAP handles the in/out contract translation, not this function
-        "deal_time": deal.time,
+        "entry": deal.entry,
+        "deal_time": datetime.fromtimestamp(deal.time, tz=timezone.utc).isoformat(),
         "deal_price": deal.price,
         "pnl": deal.profit,
         "commission": deal.commission,

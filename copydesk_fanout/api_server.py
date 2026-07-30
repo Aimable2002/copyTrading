@@ -112,17 +112,6 @@ def _resolve_owned_account(
 def _resolve_account_owner(
     account_user_map: dict[str, str], account_id: str, user_id: str,
 ) -> Literal["master", "follower"]:
-    """Ownership check WITHOUT requiring a live agent - used by the
-    wallet/billing/roster/rate routes below. These operate on Supabase
-    state, not the running MT5 agent (unlike pause/resume/close/trades,
-    which genuinely need a live agent and keep using
-    _resolve_owned_account above). A closed account's owner still needs
-    to see their final wallet balance and transaction history, so gating
-    this on fanout.master_agents/follower_agents (which close_account
-    deliberately empties) would wrongly 409 exactly the accounts most
-    likely to be checked. Role is read off the account_id's own prefix
-    (accounts are always named "{role}_{hex}", see provisioning.py) rather
-    than the live registries."""
     owner_id = account_user_map.get(account_id)
     if owner_id is None:
         raise HTTPException(status_code=404, detail=f"Unknown account {account_id}")
@@ -142,15 +131,8 @@ def create_api_app(
     account_user_map: dict[str, str],
     agents: list,
 ) -> FastAPI:
-    """Factory rather than a module-level app: main.py builds fanout/
-    supabase/account_user_map/agents at startup and hands them in here,
-    same objects the Socket.IO live-state publisher already reads from."""
     app = FastAPI(title="CopyDesk provisioning API")
 
-    # Allow-all for now, same reasoning as socket_server.py: Lovable's
-    # preview URL changes across sessions/deploys same as ngrok's does.
-    # TIGHTEN THIS before real signups - see socket_server.py's
-    # ALLOWED_ORIGINS handling for the pattern to switch to.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -160,9 +142,6 @@ def create_api_app(
 
     @app.exception_handler(RequestValidationError)
     async def _log_validation_errors(request: Request, exc: RequestValidationError):
-        # Default FastAPI behavior already returns 422 with this detail -
-        # this handler only adds console visibility, doesn't change the
-        # response the frontend sees.
         body = await request.body()
         logger.warning(
             "422 on %s - validation errors: %s | raw body sent: %s",
@@ -173,15 +152,6 @@ def create_api_app(
     @app.post("/accounts/provision")
     def provision(body: ProvisionRequest, background_tasks: BackgroundTasks, authorization: str | None = Header(default=None)):
         user_id = _authenticate(authorization)
-
-        # Phase 1 runs on the request thread, same ~45s "nice waiting" the
-        # original fully-synchronous version always used for the normal
-        # case - this blocks briefly and returns a real success/error
-        # response, exactly like before. Only the genuinely stalled case
-        # (terminal alive, not yet connected past that window - most
-        # likely needs a human to click "Later" on MT5's LiveUpdate
-        # dialog) gets deferred to a background task below; the common
-        # case never touches BackgroundTasks at all.
         try:
             agent, instance_dir, terminal_path, outcome, account_id = provision_account_start(
                 role=body.role,
@@ -211,12 +181,6 @@ def create_api_app(
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             return {"account_id": account_id, "status": "live"}
 
-        # outcome == "stalled": don't hold the request open for however
-        # long a human might take to notice and click - hand phase 2 off
-        # to a background task and respond right away with a status the
-        # frontend can surface as "needs attention". Resumes and finishes
-        # registration automatically once the terminal connects; see
-        # provision_account_finish() / _wait_stalled() in provisioning.py.
         def _resume_after_stall() -> None:
             try:
                 provision_account_finish(
@@ -227,9 +191,6 @@ def create_api_app(
                     master_account_id=body.master_account_id, multiplier=body.multiplier, sizing_mode=body.sizing_mode,
                 )
             except ProvisioningError:
-                # Real, final failure (terminal died mid-wait, or the
-                # max-wait was exceeded) - logged here since there's no
-                # live HTTP request left to turn this into a response for.
                 logger.exception("Provisioning failed for user %s (account_id %s) during stalled wait", user_id, account_id)
             except Exception:  # noqa: BLE001 - a background task with no caller to reraise to must not die silently
                 logger.exception("Unexpected provisioning failure for user %s (account_id %s) during stalled wait", user_id, account_id)
@@ -343,6 +304,7 @@ def create_api_app(
     def wallet_transactions(account_id: str, authorization: str | None = Header(default=None)):
         user_id = _authenticate(authorization)
         _resolve_account_owner(account_user_map, account_id, user_id)
+        print("/accounts/{account_id}/wallet/transactions :", wallet.list_transactions(account_id, supabase_client))
         return wallet.list_transactions(account_id, supabase_client)
 
     # ----------------------------------------------------------------
@@ -370,16 +332,6 @@ def create_api_app(
 
     @app.post("/accounts/{account_id}/billing/reactivate")
     def reactivate_billing(account_id: str, body: SelectPackageRequest, authorization: str | None = Header(default=None)):
-        """Recreates a billing_period after a grace-expiry closed one -
-        this is ONLY the billing side. If account_lifecycle.close_account
-        already tore down the underlying MT5 terminal process (it does,
-        once the 5-day grace window fully expires - see billing.py's
-        check_grace_expirations), the account also needs re-provisioning
-        (a fresh POST /accounts/provision) to actually run again; this
-        route doesn't do that, and deliberately doesn't pretend to - it's
-        a real gap between "billing reactivated" and "trading resumed"
-        that the frontend needs to walk the user through as two steps,
-        not one, until a proper re-provision-in-place flow exists."""
         user_id = _authenticate(authorization)
         role = _resolve_account_owner(account_user_map, account_id, user_id)
         try:

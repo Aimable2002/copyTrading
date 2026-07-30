@@ -30,4 +30,5 @@ def get_account_trade_history(agent: BaseAgent, lookback_days: int = 30) -> list
         deal = dict(deal)
         deal["entry"] = ENTRY_MAP.get(deal.get("entry"), deal.get("entry"))
         trades.append({"deal_ticket": ticket, **deal})
+    print(" trades :", trades)
     return trades
