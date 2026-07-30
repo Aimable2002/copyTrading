@@ -109,7 +109,7 @@ def _run_supabase_mode(serve: bool) -> None:
     import os
 
     from .supabase_client import execute_with_retry, get_supabase_client
-    from .provisioning import read_provisioned_credentials, resolve_instance_dir
+    from .provisioning import ProvisioningError, read_provisioned_credentials, resolve_instance_dir
 
     supabase = get_supabase_client()
 
@@ -141,6 +141,7 @@ def _run_supabase_mode(serve: bool) -> None:
 
     agents: list[TerminalAgent] = []
     account_user_map: dict[str, str] = {}
+    skipped_accounts: list[str] = []
     for account in accounts:
         account_user_map[account["account_id"]] = account["user_id"]
 
@@ -158,7 +159,34 @@ def _run_supabase_mode(serve: bool) -> None:
         # exe path (what mt5.initialize() actually needs) is rebuilt from there.
         stored_path = account["metatrader_dir_path"]
         instance_dir = resolve_instance_dir(stored_path)
-        login, password, server = read_provisioned_credentials(instance_dir)
+
+        # A row can outlive its instance folder on THIS machine (deleted,
+        # never synced here, or provisioning interrupted before
+        # provisioned_config.ini got written). That's a per-account data
+        # problem, not a reason to take the whole fanout process down -
+        # skip just this account and keep starting up with whatever
+        # accounts are actually recoverable.
+        if not instance_dir.exists():
+            logger.warning(
+                "Skipping account %s (%s): instance dir not found on disk: %s. "
+                "This account will not be polled until its instance dir is restored "
+                "or the account is re-provisioned.",
+                account["account_id"], account["role"], instance_dir,
+            )
+            account_user_map.pop(account["account_id"], None)
+            skipped_accounts.append(account["account_id"])
+            continue
+
+        try:
+            login, password, server = read_provisioned_credentials(instance_dir)
+        except ProvisioningError as exc:
+            logger.warning(
+                "Skipping account %s (%s): %s",
+                account["account_id"], account["role"], exc,
+            )
+            account_user_map.pop(account["account_id"], None)
+            skipped_accounts.append(account["account_id"])
+            continue
 
         exe_name = os.environ.get("TERMINAL_EXECUTABLE_NAME", "terminal64.exe")
         terminal_path = str(instance_dir / exe_name)
@@ -185,6 +213,12 @@ def _run_supabase_mode(serve: bool) -> None:
             fanout.register_follower(agent)
         agents.append(agent)
         logger.info("Registered %s: %s", account["role"], account["account_id"])
+
+    if skipped_accounts:
+        logger.warning(
+            "Started up with %d account(s) skipped due to missing instance data: %s",
+            len(skipped_accounts), ", ".join(skipped_accounts),
+        )
 
     # NOTE: this still only registers agents that were `live` at startup -
     # dynamically adding an agent when a new account goes live mid-run
