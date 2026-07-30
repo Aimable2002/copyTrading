@@ -106,8 +106,10 @@ def _run_local_file_mode(config_path: Path) -> None:
 
 def _run_supabase_mode(serve: bool) -> None:
     # Local import: keeps `supabase` an optional dependency for local-file-mode-only use.
+    import os
+
     from .supabase_client import execute_with_retry, get_supabase_client
-    from .provisioning import read_provisioned_credentials
+    from .provisioning import read_provisioned_credentials, resolve_instance_dir
 
     supabase = get_supabase_client()
 
@@ -143,17 +145,23 @@ def _run_supabase_mode(serve: bool) -> None:
         account_user_map[account["account_id"]] = account["user_id"]
 
         # Credentials are never read from Supabase, by design - only
-        # terminal_path is persisted there. login/password/server live
-        # exclusively in provisioned_config.ini next to the terminal
+        # metatrader_dir_path is persisted there. login/password/server
+        # live exclusively in provisioned_config.ini next to the terminal
         # itself (see provisioning.py's _write_startup_config /
         # read_provisioned_credentials), recovered here from disk on
         # every restart instead.
-        # Column name unchanged (metatrader_dir_path, no frontend impact) -
-        # only what it now points at changed: terminal64.exe, not the old
-        # MQL5/Files folder.
-        terminal_path = account["metatrader_dir_path"]
-        instance_dir = Path(terminal_path).parent
+        #
+        # metatrader_dir_path keeps its original MQL5\Files-suffixed shape
+        # (frontend/existing rows depend on that convention) - it does NOT
+        # point straight at the instance root or the exe. resolve_instance_dir()
+        # strips that suffix back off to get the real instance root, and the
+        # exe path (what mt5.initialize() actually needs) is rebuilt from there.
+        stored_path = account["metatrader_dir_path"]
+        instance_dir = resolve_instance_dir(stored_path)
         login, password, server = read_provisioned_credentials(instance_dir)
+
+        exe_name = os.environ.get("TERMINAL_EXECUTABLE_NAME", "terminal64.exe")
+        terminal_path = str(instance_dir / exe_name)
 
         if account["role"] == "master":
             agent = TerminalAgent(

@@ -1,41 +1,3 @@
-"""
-Turns user-submitted MT5 credentials into a running, registered
-TerminalAgent/FollowerAgent - the automation layer from the "how does
-MetaApi do this" discussion: clone a pre-configured template terminal
-folder, write per-account login + EA-parameter files, launch the terminal
-in portable mode, wait for the EA to come alive, then wire it into the
-already-running FanoutCore the same way main.py wires up startup accounts.
-
-Required environment variables:
-  TEMPLATE_TERMINAL_DIR
-      Path to a ONE-TIME, manually prepared portable MT5 install:
-      DWX_Server_MT5.ex5 already dropped in MQL5/Experts/, the terminal's
-      AutoTrading toggle turned on, the EA's own "Allow Algo Trading"
-      ticked, then the terminal closed normally. That on/off state is
-      saved inside this folder's own files, so every clone inherits it -
-      this is the actual mechanism, not a config key (see the AutoTrading
-      conversation this was built from). This needs a one-time real check:
-      confirm a cloned copy with swapped credentials keeps that state on
-      your broker/build before relying on it for real users.
-  INSTANCES_DIR
-      Where per-account clones are created.
-  TERMINAL_EXECUTABLE_NAME
-      Filename only (not a path) of the terminal binary inside the cloned
-      instance dir, e.g. "terminal64.exe" for MT5. NOTE: portable mode
-      ties the data folder to wherever this exe physically lives - it is
-      NOT determined by /config: or the process's working directory. That
-      means every clone must run ITS OWN copy of the exe (already true,
-      since _clone_template() copies the whole template dir including the
-      binary) - launching one shared, fixed exe path for every account
-      would make every instance silently share the same data folder.
-
-Both EA-level order caps (MaximumOrders, MaximumLotSize) - which hard-
-REJECT orders past their default values regardless of what Supabase's
-subscription config says, see mql/DWX_Server_MT5.mq5 lines ~290 and ~319 -
-are overridden per-instance via a generated .set file, so Supabase's
-multiplier/sizing_mode stays the only real limiter.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -57,24 +19,14 @@ logger = logging.getLogger("provisioning")
 
 Role = Literal["master", "follower"]
 
-# High enough to never be the real limiter - Supabase's sizing config
-# (enforced in sizing.py) is meant to be the only thing that actually
-# constrains order count/size, not these EA-level inputs.
-# Passed straight to TerminalAgent/FollowerAgent's max_orders/max_lot_size
-# (see mt5_terminal.py's check_order_caps) - this is the direct Python
-# replacement for what used to be a generated .set file read by the EA.
 _ORDER_MAX_ORDERS = 999
 _ORDER_MAX_LOT_SIZE = 100.0
 
 _CONNECT_TIMEOUT_SECONDS = 45
 _CONNECT_POLL_SECONDS = 1.0
 
-# Second phase, only entered if the terminal process is still alive past
-# _CONNECT_TIMEOUT_SECONDS but hasn't connected yet - the "someone needs to
-# click Later on the LiveUpdate dialog" case. Not a failure by itself; see
-# _wait_fast / _wait_stalled.
 _STALLED_LOG_INTERVAL_SECONDS = 30
-_MAX_STALLED_WAIT_SECONDS = 1800  # 30 min upper bound - last-resort safety net, not a normal expectation
+_MAX_STALLED_WAIT_SECONDS = 1800 
 
 
 class ProvisioningError(Exception):
@@ -197,6 +149,35 @@ def _terminal_exe_path(instance_dir: Path) -> str:
     return str(instance_dir / exe_name)
 
 
+def resolve_instance_dir(stored_path: str) -> Path:
+    """Turns whatever accounts.metatrader_dir_path holds into the real
+    instance root (the folder containing terminal64.exe and
+    provisioned_config.ini).
+
+    The frontend/DB convention keeps the legacy
+    instances/<account_id>/MQL5/Files suffix on this column (pre-dates the
+    move to a native mt5.initialize() connection, and isn't being changed -
+    other things depend on that shape) - so this strips that suffix back
+    down to the instance root rather than assuming the column already
+    holds the root or the exe path. Also tolerates a bare exe path or a
+    bare instance-root value, so nothing breaks if either of those ever
+    ends up in the column instead.
+    """
+    p = Path(stored_path)
+    if p.name.lower() == "files" and p.parent.name.upper() == "MQL5":
+        return p.parent.parent
+    if p.suffix.lower() == ".exe":
+        return p.parent
+    return p
+
+
+def _legacy_display_path(instance_dir: Path) -> str:
+    """Builds the MQL5\\Files-suffixed path this column has always stored,
+    so newly provisioned accounts keep writing the same shape the
+    frontend and existing rows already use - inverse of resolve_instance_dir()."""
+    return str(instance_dir / "MQL5" / "Files")
+
+
 ConnectOutcome = Literal["connected", "stalled"]
 
 
@@ -223,7 +204,7 @@ def _wait_fast(agent: TerminalAgent, timeout: float = _CONNECT_TIMEOUT_SECONDS) 
         raise ProvisioningError(
             f"Terminal process for {agent.account_id} exited before connecting (exit code "
             f"{launched_process.returncode}) - check the launched terminal directly: bad "
-            f"credentials, AutoTrading off, or the EA failed to attach are the three usual causes."
+            f"credentials or the terminal's AutoTrading toggle being off are the usual causes."
         )
     return "stalled"
 
@@ -370,7 +351,10 @@ def finalize_provisioned_account(
                 "account_id": account_id,
                 "user_id": user_id,
                 "role": role,
-                "metatrader_dir_path": terminal_path,  # same column name the frontend already reads - only the value's meaning changed (now the terminal64.exe path, not the old MQL5/Files folder)
+                # Keep the MQL5\Files-suffixed shape the frontend/existing rows
+                # already use - resolve_instance_dir() is what strips it back
+                # off on the read side (main.py) to get the real exe path.
+                "metatrader_dir_path": _legacy_display_path(Path(terminal_path).parent),
                 "status": "live",
             }
         ).execute()
