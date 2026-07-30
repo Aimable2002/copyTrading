@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("live_state_publisher")
 
-DEFAULT_INTERVAL_SECONDS = 1.0  # throttled on purpose - this is a display refresh rate, not the ~25ms trading poll rate
+DEFAULT_INTERVAL_SECONDS = 0.01  # throttled on purpose - this is a display refresh rate, not the ~25ms trading poll rate
 
 
 def _serialize_open_positions(agent: BaseAgent) -> list[dict[str, Any]]:

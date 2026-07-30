@@ -187,6 +187,7 @@ class FanoutCore:
                     "order_send rejected for follower %s: retcode=%s comment=%s",
                     sub.follower_account_id, result.get("retcode"), result.get("comment"),
                 )
+                print(" logging the entire results of order attempted :", result)
                 continue
 
             logger.info(

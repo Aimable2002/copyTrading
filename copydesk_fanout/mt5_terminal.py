@@ -42,6 +42,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from datetime import datetime, timedelta, timezone
 
 # MT5 request/trade constants. Hardcoded rather than read off the mt5
 # module so the pure builder functions below can be unit tested without
@@ -122,6 +123,7 @@ DEAL_ENTRY_OUT = 1
 
 
 def deal_to_historic_trade_dict(deal: Any) -> dict:
+    # print(" deals logs :", deals)
     return {
         "symbol": deal.symbol,
         "lots": round(deal.volume, 2),
@@ -277,30 +279,11 @@ def _worker_main(
     instance_dir/terminal64.exe (see provisioning.py's _launch_terminal).
     """
     import MetaTrader5 as mt5  
-    # ok = mt5.initialize(path=terminal_path, login=login, password=password, server=server, portable=True)
-    print(" the logins :", login)
-    print(" server :", server)
-    ok = mt5.initialize(path=r"C:\Users\ISO\Desktop\automation\instances\master_960e83d490\terminal64.exe", login=login, password=password, server=server, portable=True)
+    ok = mt5.initialize(path=terminal_path, login=int(login), password=password, server=server, portable=True)
     state["connected"] = bool(ok)
     if not ok:
-        print(" Failed in not ok ...............")
+        print(" Failed in not ok ...............", mt5.last_error())
         state["last_error"] = str(mt5.last_error())
-    
-    account_info=mt5.account_info()
-    if account_info!=None:
-        # display trading account data 'as is'
-        print(account_info)
-        # display trading account data in the form of a dictionary
-        print("Show account_info()._asdict():")
-        account_info_dict = mt5.account_info()._asdict()
-        for prop in account_info_dict:
-            print("  {}={}".format(prop, account_info_dict[prop]))
-        print()
- 
-        # convert the dictionary into DataFrame and print
-        df=pd.DataFrame(list(account_info_dict.items()),columns=['property','value'])
-        print("account_info() as dataframe:")
-        print(df)
 
     while True:
         # Drain any pending write commands first - these are latency
@@ -343,29 +326,10 @@ def _handle_command(mt5_module, cmd_type: str, payload: dict) -> dict:
         result = mt5_module.order_send(request)
         return _order_result_to_dict(result)
     if cmd_type == "get_historic_trades":
-        from datetime import datetime, timedelta, timezone
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=payload["lookback_days"])
         deals = mt5_module.history_deals_get(start, end)  # i suspect that this line is wrong it maybe suppose to take 3 parameters
-        # if not mt5_module.initialize():
-        #     print("initialize() failed, error code =",mt5_module.last_error())
-        #     quit()
-        # account_info=mt5_module.account_info()
-        # if account_info!=None:
-        #     # display trading account data 'as is'
-        #     print(account_info)
-        #     # display trading account data in the form of a dictionary
-        #     print("Show account_info()._asdict():")
-        #     account_info_dict = mt5_module.account_info()._asdict()
-        #     for prop in account_info_dict:
-        #         print("  {}={}".format(prop, account_info_dict[prop]))
-        #     print()
-    
-        #     # convert the dictionary into DataFrame and print
-        #     df=pd.DataFrame(list(account_info_dict.items()),columns=['property','value'])
-        #     print("account_info() as dataframe:")
-        #     print(df)
-        print(" deals :", deals)
+        # print(" deals in handle commands :", deals)
         return {"historic_trades": deals_to_historic_trades(deals)}
     return {"error": f"unknown command type: {cmd_type}"}
 
@@ -498,4 +462,5 @@ class Mt5Terminal:
     def get_historic_trades(self, lookback_days: int = 30) -> dict:
         result = self._send_command("get_historic_trades", dict(lookback_days=lookback_days))
         self._historic_trades = result.get("historic_trades", {})
+        # print(" self historic trades :", self._historic_trades)
         return self._historic_trades

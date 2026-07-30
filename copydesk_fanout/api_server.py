@@ -259,6 +259,7 @@ def create_api_app(
         user_id = _authenticate(authorization)
         role = _resolve_owned_account(fanout, account_user_map, account_id, user_id)
         agent = fanout.master_agents.get(account_id) if role == "master" else fanout.follower_agents.get(account_id)
+        # print("investigating this route /accounts/{account_id}/trades :", trade_history.get_account_trade_history(agent))
         return trade_history.get_account_trade_history(agent)
 
     @app.get("/masters/{account_id}/trades")

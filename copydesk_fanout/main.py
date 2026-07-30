@@ -195,7 +195,7 @@ def _run_supabase_mode(serve: bool) -> None:
             agent = TerminalAgent(
                 account_id=account["account_id"],
                 terminal_path=terminal_path,
-                login=login,
+                login=int(login),
                 password=password,
                 server=server,
                 on_trade_event=fanout.handle_master_trade_event,
@@ -205,7 +205,7 @@ def _run_supabase_mode(serve: bool) -> None:
             agent = FollowerAgent(
                 account_id=account["account_id"],
                 terminal_path=terminal_path,
-                login=login,
+                login=int(login),
                 password=password,
                 server=server,
                 on_trade_event=fanout.handle_follower_trade_event,
