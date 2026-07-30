@@ -56,10 +56,12 @@ def _serialize_open_positions(agent: BaseAgent) -> list[dict[str, Any]]:
                 "TP": order.get("TP"),
             }
         )
+    # print(" positions in serelialization :", positions)
     return positions
 
 
 def _build_state(agent: BaseAgent) -> dict[str, Any]:
+    # print(" checking what the agent termonal account info has :", agent.terminal.account_info)
     return {
         "balance": agent.terminal.account_info.get("balance"),
         "equity": agent.terminal.account_info.get("equity"),
@@ -69,7 +71,7 @@ def _build_state(agent: BaseAgent) -> dict[str, Any]:
 
 def _write_live_state_row(supabase_client: Any, account_id: str, state: dict[str, Any]) -> None:
     try:
-        print(" writing state data to db ===============")
+        # print(" writing state data to db ===============")
         execute_with_retry(
             lambda: supabase_client.table("live_account_state").upsert(
                 {
@@ -98,19 +100,24 @@ async def run_live_state_publisher(
     loop = asyncio.get_event_loop()
 
     while True:
+        # print(" is this running /////////////////////////////////")
         agents: dict[str, BaseAgent] = {**fanout.master_agents, **fanout.follower_agents}
 
         for account_id, agent in agents.items():
             try:
+                # print(" DEBUG agent logs :", agent)
                 if not agent.is_connected:
+                    # print(" the agent.is_connected blocked the loop to continue investigate this gap")
                     continue  
 
                 user_id = account_user_map.get(account_id)
+                # print(" printing the user :", user_id)
                 if not user_id:
                     logger.warning("No user_id mapped for account %s - skipping publish", account_id)
                     continue
-
+                # print(" The print debug before the state is called ......")
                 state = _build_state(agent)
+                # print(" state from __build state :", state)
 
                 try:
                     await emit_account_state(user_id, account_id, state)

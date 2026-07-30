@@ -277,11 +277,30 @@ def _worker_main(
     instance_dir/terminal64.exe (see provisioning.py's _launch_terminal).
     """
     import MetaTrader5 as mt5  
-
-    ok = mt5.initialize(path=terminal_path, login=login, password=password, server=server, portable=True)
+    # ok = mt5.initialize(path=terminal_path, login=login, password=password, server=server, portable=True)
+    print(" the logins :", login)
+    print(" server :", server)
+    ok = mt5.initialize(path=r"C:\Users\ISO\Desktop\automation\instances\master_960e83d490\terminal64.exe", login=login, password=password, server=server, portable=True)
     state["connected"] = bool(ok)
     if not ok:
+        print(" Failed in not ok ...............")
         state["last_error"] = str(mt5.last_error())
+    
+    account_info=mt5.account_info()
+    if account_info!=None:
+        # display trading account data 'as is'
+        print(account_info)
+        # display trading account data in the form of a dictionary
+        print("Show account_info()._asdict():")
+        account_info_dict = mt5.account_info()._asdict()
+        for prop in account_info_dict:
+            print("  {}={}".format(prop, account_info_dict[prop]))
+        print()
+ 
+        # convert the dictionary into DataFrame and print
+        df=pd.DataFrame(list(account_info_dict.items()),columns=['property','value'])
+        print("account_info() as dataframe:")
+        print(df)
 
     while True:
         # Drain any pending write commands first - these are latency
@@ -300,6 +319,7 @@ def _worker_main(
             ok = mt5.initialize(path=terminal_path, login=login, password=password, server=server, portable=True)
             state["connected"] = bool(ok)
             time.sleep(1)
+            # print(" mt5 is none so it failed here this one crashed the system ")
             continue
 
         state["connected"] = True
@@ -327,6 +347,24 @@ def _handle_command(mt5_module, cmd_type: str, payload: dict) -> dict:
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=payload["lookback_days"])
         deals = mt5_module.history_deals_get(start, end)  # i suspect that this line is wrong it maybe suppose to take 3 parameters
+        # if not mt5_module.initialize():
+        #     print("initialize() failed, error code =",mt5_module.last_error())
+        #     quit()
+        # account_info=mt5_module.account_info()
+        # if account_info!=None:
+        #     # display trading account data 'as is'
+        #     print(account_info)
+        #     # display trading account data in the form of a dictionary
+        #     print("Show account_info()._asdict():")
+        #     account_info_dict = mt5_module.account_info()._asdict()
+        #     for prop in account_info_dict:
+        #         print("  {}={}".format(prop, account_info_dict[prop]))
+        #     print()
+    
+        #     # convert the dictionary into DataFrame and print
+        #     df=pd.DataFrame(list(account_info_dict.items()),columns=['property','value'])
+        #     print("account_info() as dataframe:")
+        #     print(df)
         print(" deals :", deals)
         return {"historic_trades": deals_to_historic_trades(deals)}
     return {"error": f"unknown command type: {cmd_type}"}
