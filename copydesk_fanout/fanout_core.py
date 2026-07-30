@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import time
 
 from .config_store import ConfigStore
 from .follower_agent import FollowerAgent
@@ -16,15 +15,6 @@ logger = logging.getLogger("fanout_core")
 # Below this, a partial-close reduction rounds to noise - just skip it
 # rather than send a broker a close command for 0.00 lots.
 _MIN_PARTIAL_CLOSE_LOTS = 0.01
-
-# A ticket can genuinely still show open_price=0 for a brief window right
-# after it's created - the file write can land before MT5 finishes
-# settling the fill. This is a bounded, inline wait for that to clear -
-# NOT a general polling architecture: it only ever runs once per fill, on
-# the follower's own background thread, and gives up after ~2.5s rather
-# than looping forever.
-_PRICE_SETTLE_RETRIES = 5
-_PRICE_SETTLE_RETRY_SECONDS = 0.5
 
 
 class FanoutCore:
@@ -128,7 +118,7 @@ class FanoutCore:
 
     def _fan_out_open(self, master_account_id: str, master_ticket: str, master_order: dict) -> None:
         master_agent = self.master_agents.get(master_account_id)
-        print(" debugging masters order :", master_order)
+        # print(" debugging masters order :", master_order)
         if master_agent is None:
             logger.warning("Trade event for unknown master account %s", master_account_id)
             return
@@ -164,17 +154,20 @@ class FanoutCore:
                 continue
 
             self.pair_store.add_pending(master_account_id, master_ticket, sub.follower_account_id, dispatched_lots=lots)
-            # SL/TP intentionally NOT passed here (0/0 - open cleanly first).
-            # order_send() is synchronous now, but the fill still isn't
-            # necessarily reflected in positions_get() the instant this
-            # call returns - distance-based SL/TP is still computed and
-            # applied once the fill is confirmed - see handle_follower_trade_event.
+            sl_distance, tp_distance = sl_tp_distance(
+                order_type=master_order["type"],
+                entry_price=master_order["open_price"],
+                sl=master_order.get("SL", 0),
+                tp=master_order.get("TP", 0),
+            )
             try:
                 result = follower_agent.execute_open(
                     master_ticket=master_ticket,
                     symbol=master_order["symbol"],
                     order_type=master_order["type"],
                     lots=lots,
+                    sl_distance=sl_distance,
+                    tp_distance=tp_distance,
                 )
             except OrderCapExceeded:
                 logger.exception(
@@ -318,7 +311,6 @@ class FanoutCore:
                 if confirmed:
                     logger.info("Confirmed fill: follower %s#%s <- master#%s at %.5f",
                                 follower_account_id, ticket, master_ticket, order["open_price"])
-                    self._apply_initial_sl_tp(follower_account_id, master_ticket, ticket, order)
                 else:
                     logger.warning(
                         "Follower %s got a new order tagged for master#%s but no pending copy was found "
@@ -337,75 +329,3 @@ class FanoutCore:
                     "or the follower closed it manually",
                     follower_account_id, ticket, master_ticket,
                 )
-
-    def _apply_initial_sl_tp(self, follower_account_id: str, master_ticket: str, follower_ticket: str, follower_order: dict) -> None:
-        """
-        Called right after a follower's fill is confirmed - applies the
-        master's SL/TP distance to the follower's real fill price.
-
-        Reads prices from the LIVE dwx.open_orders dict on both agents, not
-        the frozen `follower_order` argument or master_agent._last_orders:
-        both of those are one-time snapshots taken at the instant each
-        ticket first appeared, and can be stuck at open_price=0 for the
-        life of the trade if that first snapshot raced MT5 still settling
-        the fill - dwx.open_orders itself keeps getting refreshed by the
-        agent's own background poll thread and self-corrects within a
-        second or so, we just weren't looking at it.
-
-        If it's still not settled after a short bounded wait, this gives up
-        and skips - no SL/TP this time rather than sending MT5 a garbage
-        price - there's no separate retry scheduled after that; a follower
-        without SL/TP still has the right direction/lots/entry, which is
-        the important part, and any subsequent SL/TP change the master
-        makes will still propagate normally via _fan_out_modify.
-        """
-        for master_account_id, master_agent in self.master_agents.items():
-            master_order = master_agent.terminal.open_orders.get(master_ticket)
-            if master_order is None:
-                continue  # this master doesn't have this ticket - keep looking, or it's genuinely gone already
-
-            follower_agent = self.follower_agents.get(follower_account_id)
-            if follower_agent is None:
-                return
-
-            master_entry = master_order.get("open_price", 0)
-            follower_entry = 0
-            for _ in range(_PRICE_SETTLE_RETRIES):
-                live_master_order = master_agent.terminal.open_orders.get(master_ticket)
-                live_follower_order = follower_agent.terminal.open_orders.get(follower_ticket)
-                master_entry = live_master_order.get("open_price", 0) if live_master_order else 0
-                follower_entry = live_follower_order.get("open_price", 0) if live_follower_order else 0
-                if master_entry and follower_entry:
-                    master_order = live_master_order
-                    break
-                time.sleep(_PRICE_SETTLE_RETRY_SECONDS)
-            else:
-                logger.warning(
-                    "Follower %s#%s / master#%s never showed a settled entry price after %.1fs - "
-                    "skipping initial SL/TP for this fill",
-                    follower_account_id, follower_ticket, master_ticket,
-                    _PRICE_SETTLE_RETRIES * _PRICE_SETTLE_RETRY_SECONDS,
-                )
-                return
-
-            sl_distance, tp_distance = sl_tp_distance(
-                order_type=master_order["type"],
-                entry_price=master_entry,
-                sl=master_order.get("SL", 0),
-                tp=master_order.get("TP", 0),
-            )
-            if not sl_distance and not tp_distance:
-                return  
-
-            follower_sl, follower_tp = apply_sl_tp_distance(
-                order_type=follower_order["type"],
-                entry_price=follower_entry,
-                sl_distance=sl_distance,
-                tp_distance=tp_distance,
-            )
-            follower_agent.execute_modify(follower_ticket=follower_ticket, stop_loss=follower_sl, take_profit=follower_tp)
-            logger.info(
-                "Applied initial distance-based SL/TP: follower %s#%s -> SL=%.5f TP=%.5f",
-                follower_account_id, follower_ticket, follower_sl, follower_tp,
-            )
-            return

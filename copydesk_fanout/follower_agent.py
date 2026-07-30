@@ -54,27 +54,17 @@ class FollowerAgent(TerminalAgent):
         order_type: str,
         lots: float,
         price: float = 0,
-        stop_loss: float = 0,
-        take_profit: float = 0,
+        sl_distance: float = 0,
+        tp_distance: float = 0,
         magic: int = 0,
     ) -> dict:
-        """order_type must be 'buy' or 'sell' (lowercase). Returns the
-        order_send() result dict (success, retcode, comment, order, deal,
-        price, volume) synchronously - unlike the old DWX version, this
-        call itself tells you whether the order was accepted, no need to
-        wait on a separate poll to find out the command was even received.
-        Raises OrderCapExceeded before ever calling order_send() if this
-        would violate the per-instance MaximumOrders/MaximumLotSize caps -
-        callers (fanout_core.py) should catch this the same way they'd
-        catch any other dispatch failure.
-        """
         return self.terminal.open_order(
             symbol=symbol,
             order_type=order_type,
             lots=round(lots, 2),
             price=price,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
+            sl_distance=sl_distance,
+            tp_distance=tp_distance,
             magic=magic,
             comment=self._copy_comment(master_ticket),
         )

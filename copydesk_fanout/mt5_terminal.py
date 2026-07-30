@@ -44,6 +44,8 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 from datetime import datetime, timedelta, timezone
 
+from .sltp import apply_sl_tp_distance
+
 # MT5 request/trade constants. Hardcoded rather than read off the mt5
 # module so the pure builder functions below can be unit tested without
 # MetaTrader5 installed - these are stable, documented values on every
@@ -314,9 +316,44 @@ def _worker_main(
 
 def _handle_command(mt5_module, cmd_type: str, payload: dict) -> dict:
     if cmd_type == "open_order":
+        if not mt5_module.symbol_select(payload["symbol"], True):
+            return {
+                "success": False,
+                "retcode": None,
+                "comment": f"symbol_select failed for {payload['symbol']}",
+            }
+
+        sl_distance = payload.pop("sl_distance", 0)
+        tp_distance = payload.pop("tp_distance", 0)
+        if not payload.get("price"):
+            tick = mt5_module.symbol_info_tick(payload["symbol"])
+            if tick is None:
+                return {
+                    "success": False,
+                    "retcode": None,
+                    "comment": f"symbol_info_tick returned None for {payload['symbol']}",
+                }
+            is_buy = order_type_str_to_mt5(payload["order_type"]) == ORDER_TYPE_BUY
+            payload = {**payload, "price": tick.ask if is_buy else tick.bid}
+
+        sl, tp = apply_sl_tp_distance(
+            order_type=payload["order_type"],
+            entry_price=payload["price"],
+            sl_distance=sl_distance,
+            tp_distance=tp_distance,
+        )
+        payload = {**payload, "stop_loss": sl, "take_profit": tp}
+
         request = build_open_request(**payload)
         result = mt5_module.order_send(request)
+        if result is None:
+            return {
+                "success": False,
+                "retcode": None,
+                "comment": f"order_send returned None, last_error={mt5_module.last_error()}",
+            }
         return _order_result_to_dict(result)
+
     if cmd_type == "close_order":
         request = build_close_request(**payload)
         result = mt5_module.order_send(request)
@@ -428,7 +465,7 @@ class Mt5Terminal:
         return {"success": False, "retcode": None, "comment": "command timed out"}
 
     def open_order(self, *, symbol: str, order_type: str, lots: float, price: float = 0,
-                   stop_loss: float = 0, take_profit: float = 0, magic: int = 0, comment: str = "") -> dict:
+                   sl_distance: float = 0, tp_distance: float = 0, magic: int = 0, comment: str = "") -> dict:
         check_order_caps(
             current_open_count=len(self.open_orders),
             lots=lots,
@@ -437,7 +474,7 @@ class Mt5Terminal:
         )
         return self._send_command("open_order", dict(
             symbol=symbol, order_type=order_type, lots=lots, price=price,
-            stop_loss=stop_loss, take_profit=take_profit, magic=magic, comment=comment,
+            sl_distance=sl_distance, tp_distance=tp_distance, magic=magic, comment=comment,
         ))
 
     def close_order(self, ticket: int, lots: float = 0) -> dict:
