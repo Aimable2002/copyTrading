@@ -5,6 +5,7 @@ import time
 
 from .config_store import ConfigStore
 from .follower_agent import FollowerAgent
+from .mt5_terminal import OrderCapExceeded
 from .order_pair_store import OrderPairStore
 from .sizing import calculate_follower_volume
 from .sltp import apply_sl_tp_distance, sl_tp_distance
@@ -16,20 +17,26 @@ logger = logging.getLogger("fanout_core")
 # rather than send a broker a close command for 0.00 lots.
 _MIN_PARTIAL_CLOSE_LOTS = 0.01
 
-# A ticket can genuinely still show open_price=0 for a brief window right
-# after it's created - the file write can land before MT5 finishes
-# settling the fill. This is a bounded, inline wait for that to clear -
-# NOT a general polling architecture: it only ever runs once per fill, on
-# the follower's own background thread, and gives up after ~2.5s rather
-# than looping forever.
-_PRICE_SETTLE_RETRIES = 5
-_PRICE_SETTLE_RETRY_SECONDS = 0.5
+# A close that keeps failing past this many attempts almost always means
+# something the retry sweep can't fix on its own (symbol suspended,
+# invalid stops, account-level reject) - stop hammering the broker and
+# surface it as an error for a human instead.
+_MAX_CLOSE_RETRY_ATTEMPTS = 5
+
+# A rejected close on a LIVE position can't sit waiting for the next sweep
+# cycle - the market is still moving and every second is more slippage on
+# an un-hedged follower position. So a failure is retried immediately,
+# inline, right here, before ever falling back to the periodic sweep (the
+# sweep exists only to catch the case where the broker is still rejecting
+# after all of these - see retry_failed_closes below).
+_INLINE_CLOSE_RETRY_ATTEMPTS = 4
+_INLINE_CLOSE_RETRY_DELAY_SECONDS = 0.2
 
 
 class FanoutCore:
     """
     The actual new logic this whole build was for. Everything else
-    (DWX Connect, the sizing formulas) is reused; this class is what
+    (native MT5 execution via Mt5Terminal, the sizing formulas) is reused; this class is what
     connects them: master trade detected -> per-follower size computed ->
     dispatched -> pairing tracked so later closes/modifies/partial-closes on
     the master propagate to the right follower tickets.
@@ -43,6 +50,10 @@ class FanoutCore:
         self.pair_store = pair_store
         self.master_agents: dict[str, TerminalAgent] = {}
         self.follower_agents: dict[str, FollowerAgent] = {}
+        # (master_account_id, master_ticket) -> set of follower_account_id
+        # whose close is still outstanding - see _attempt_close/retry_failed_closes.
+        self._pending_close_retries: dict[tuple[str, str], set[str]] = {}
+        self._close_retry_attempts: dict[tuple[str, str], int] = {}
 
     def register_master(self, agent: TerminalAgent) -> None:
         self.master_agents[agent.account_id] = agent
@@ -105,7 +116,7 @@ class FanoutCore:
                     "Catching up on master %s#%s - opened while this process was offline",
                     master_account_id, master_ticket,
                 )
-                self._fan_out_open(master_account_id, master_ticket, result.live_orders[master_ticket])
+                # self._fan_out_open(master_account_id, master_ticket, result.live_orders[master_ticket])  this line is dangerous never uncomment this line or ....
 
         for follower_account_id, follower_agent in self.follower_agents.items():
             expected = self.pair_store.get_expected_follower_tickets(follower_account_id)
@@ -127,6 +138,7 @@ class FanoutCore:
 
     def _fan_out_open(self, master_account_id: str, master_ticket: str, master_order: dict) -> None:
         master_agent = self.master_agents.get(master_account_id)
+        # print(" debugging masters order :", master_order)
         if master_agent is None:
             logger.warning("Trade event for unknown master account %s", master_account_id)
             return
@@ -162,16 +174,36 @@ class FanoutCore:
                 continue
 
             self.pair_store.add_pending(master_account_id, master_ticket, sub.follower_account_id, dispatched_lots=lots)
-            # SL/TP intentionally NOT passed here (0/0 - open cleanly first).
-            # We don't know the follower's real fill price yet (DWX Connect's
-            # bridge is async), so distance-based SL/TP is computed and
-            # applied once the fill is confirmed - see handle_follower_trade_event.
-            follower_agent.execute_open(
-                master_ticket=master_ticket,
-                symbol=master_order["symbol"],
+            sl_distance, tp_distance = sl_tp_distance(
                 order_type=master_order["type"],
-                lots=lots,
+                entry_price=master_order["open_price"],
+                sl=master_order.get("SL", 0),
+                tp=master_order.get("TP", 0),
             )
+            try:
+                result = follower_agent.execute_open(
+                    master_ticket=master_ticket,
+                    symbol=master_order["symbol"],
+                    order_type=master_order["type"],
+                    lots=lots,
+                    sl_distance=sl_distance,
+                    tp_distance=tp_distance,
+                )
+            except OrderCapExceeded:
+                logger.exception(
+                    "Follower %s hit its order cap - skipping this copy, other followers unaffected",
+                    sub.follower_account_id,
+                )
+                continue
+
+            if not result.get("success"):
+                logger.warning(
+                    "order_send rejected for follower %s: retcode=%s comment=%s",
+                    sub.follower_account_id, result.get("retcode"), result.get("comment"),
+                )
+                print(" logging the entire results of order attempted :", result)
+                continue
+
             logger.info(
                 "Dispatched copy: master %s#%s -> follower %s, %.2f lots",
                 master_account_id, master_ticket, sub.follower_account_id, lots,
@@ -183,15 +215,91 @@ class FanoutCore:
             logger.info("Master %s closed %s but no confirmed follower fills to close", master_account_id, master_ticket)
             return
 
+        self._attempt_close(master_account_id, master_ticket, fills)
+
+    def _attempt_close(self, master_account_id: str, master_ticket: str, fills: dict) -> None:
+        """Sends execute_close for exactly the follower fills passed in -
+        the first attempt (_fan_out_close) passes every fill for this
+        master ticket; a retry (retry_failed_closes below) passes only
+        the subset that failed last time, so an already-confirmed-closed
+        follower on the same master ticket never gets a second close
+        command sent against a ticket that's no longer open."""
+        key = (master_account_id, master_ticket)
+        failed_followers: set[str] = set()
+
         for follower_account_id, fill in fills.items():
             follower_agent = self.follower_agents.get(follower_account_id)
             if follower_agent is None:
                 continue
-            follower_agent.execute_close(follower_ticket=fill.ticket)
+
+            result = follower_agent.execute_close(follower_ticket=fill.ticket)
+            inline_attempt = 1
+            while not result.get("success") and inline_attempt < _INLINE_CLOSE_RETRY_ATTEMPTS:
+                logger.warning(
+                    "Close rejected for follower %s#%s (master %s#%s closed) - retcode=%s comment=%s - "
+                    "retrying immediately (inline attempt %d/%d)",
+                    follower_account_id, fill.ticket, master_account_id, master_ticket,
+                    result.get("retcode"), result.get("comment"),
+                    inline_attempt + 1, _INLINE_CLOSE_RETRY_ATTEMPTS,
+                )
+                time.sleep(_INLINE_CLOSE_RETRY_DELAY_SECONDS)
+                result = follower_agent.execute_close(follower_ticket=fill.ticket)
+                inline_attempt += 1
+
+            if not result.get("success"):
+                failed_followers.add(follower_account_id)
+                logger.warning(
+                    "Close FAILED for follower %s#%s (master %s#%s closed) after %d immediate attempts - "
+                    "retcode=%s comment=%s - handing off to the retry sweep rather than dropping it",
+                    follower_account_id, fill.ticket, master_account_id, master_ticket,
+                    inline_attempt, result.get("retcode"), result.get("comment"),
+                )
+                continue
+
             logger.info("Closed copy: follower %s#%s (master %s#%s closed)",
                         follower_account_id, fill.ticket, master_account_id, master_ticket)
 
-        self.pair_store.remove_master_trade(master_account_id, master_ticket)
+        if failed_followers:
+            attempts = self._close_retry_attempts.get(key, 0) + 1
+            if attempts > _MAX_CLOSE_RETRY_ATTEMPTS:
+                logger.error(
+                    "Master %s#%s: follower(s) %s still failing to close after %d attempts - "
+                    "giving up on auto-retry, this needs manual attention. Pairing stays tracked.",
+                    master_account_id, master_ticket, sorted(failed_followers), attempts - 1,
+                )
+                self._pending_close_retries.pop(key, None)
+                self._close_retry_attempts.pop(key, None)
+                return
+            self._close_retry_attempts[key] = attempts
+            self._pending_close_retries[key] = failed_followers
+        else:
+            # Only drop the pairing once every follower fill for this
+            # master ticket actually confirmed closed.
+            self._pending_close_retries.pop(key, None)
+            self._close_retry_attempts.pop(key, None)
+            self.pair_store.remove_master_trade(master_account_id, master_ticket)
+
+    def retry_failed_closes(self) -> None:
+        """Call periodically (see main.py's _close_retry_sweep). Re-sends
+        the close only for follower tickets that actually failed on a
+        previous attempt - never the whole master trade again - so a
+        follower that already closed successfully on the same master
+        ticket doesn't get a redundant close command sent against a
+        ticket that's no longer open (close_order() would just report
+        'ticket not in open_orders', which looks identical to a real
+        failure and would wrongly reset the retry count)."""
+        for key, follower_ids in list(self._pending_close_retries.items()):
+            master_account_id, master_ticket = key
+            fills = self.pair_store.get_follower_fills(master_account_id, master_ticket)
+            retry_fills = {fid: fill for fid, fill in fills.items() if fid in follower_ids}
+            if not retry_fills:
+                # Pairing is gone by some other path - nothing left to retry.
+                self._pending_close_retries.pop(key, None)
+                self._close_retry_attempts.pop(key, None)
+                continue
+            logger.info("Retrying failed close: master %s#%s -> %d follower(s)",
+                        master_account_id, master_ticket, len(retry_fills))
+            self._attempt_close(master_account_id, master_ticket, retry_fills)
 
     def _fan_out_modify(self, master_account_id: str, master_ticket: str, master_order: dict) -> None:
         """
@@ -216,13 +324,7 @@ class FanoutCore:
             if follower_agent is None:
                 continue
 
-            # fill.open_price was captured once, in OrderPairStore.confirm_fill,
-            # at the exact instant the follower's order first appeared - which
-            # can itself still be showing a not-yet-settled 0.0 (see
-            # _apply_initial_sl_tp's docstring for why). Prefer whatever the
-            # follower's terminal reports right now; fall back to the cached
-            # value only if the ticket has since closed out of dwx.open_orders.
-            live_follower_order = follower_agent.dwx.open_orders.get(fill.ticket)
+            live_follower_order = follower_agent.terminal.open_orders.get(fill.ticket)
             follower_entry_price = (
                 live_follower_order["open_price"] if live_follower_order and live_follower_order.get("open_price")
                 else fill.open_price
@@ -305,7 +407,6 @@ class FanoutCore:
                 if confirmed:
                     logger.info("Confirmed fill: follower %s#%s <- master#%s at %.5f",
                                 follower_account_id, ticket, master_ticket, order["open_price"])
-                    self._apply_initial_sl_tp(follower_account_id, master_ticket, ticket, order)
                 else:
                     logger.warning(
                         "Follower %s got a new order tagged for master#%s but no pending copy was found "
@@ -324,75 +425,3 @@ class FanoutCore:
                     "or the follower closed it manually",
                     follower_account_id, ticket, master_ticket,
                 )
-
-    def _apply_initial_sl_tp(self, follower_account_id: str, master_ticket: str, follower_ticket: str, follower_order: dict) -> None:
-        """
-        Called right after a follower's fill is confirmed - applies the
-        master's SL/TP distance to the follower's real fill price.
-
-        Reads prices from the LIVE dwx.open_orders dict on both agents, not
-        the frozen `follower_order` argument or master_agent._last_orders:
-        both of those are one-time snapshots taken at the instant each
-        ticket first appeared, and can be stuck at open_price=0 for the
-        life of the trade if that first snapshot raced MT5 still settling
-        the fill - dwx.open_orders itself keeps getting refreshed by the
-        agent's own background poll thread and self-corrects within a
-        second or so, we just weren't looking at it.
-
-        If it's still not settled after a short bounded wait, this gives up
-        and skips - no SL/TP this time rather than sending MT5 a garbage
-        price - there's no separate retry scheduled after that; a follower
-        without SL/TP still has the right direction/lots/entry, which is
-        the important part, and any subsequent SL/TP change the master
-        makes will still propagate normally via _fan_out_modify.
-        """
-        for master_account_id, master_agent in self.master_agents.items():
-            master_order = master_agent.dwx.open_orders.get(master_ticket)
-            if master_order is None:
-                continue  # this master doesn't have this ticket - keep looking, or it's genuinely gone already
-
-            follower_agent = self.follower_agents.get(follower_account_id)
-            if follower_agent is None:
-                return
-
-            master_entry = master_order.get("open_price", 0)
-            follower_entry = 0
-            for _ in range(_PRICE_SETTLE_RETRIES):
-                live_master_order = master_agent.dwx.open_orders.get(master_ticket)
-                live_follower_order = follower_agent.dwx.open_orders.get(follower_ticket)
-                master_entry = live_master_order.get("open_price", 0) if live_master_order else 0
-                follower_entry = live_follower_order.get("open_price", 0) if live_follower_order else 0
-                if master_entry and follower_entry:
-                    master_order = live_master_order
-                    break
-                time.sleep(_PRICE_SETTLE_RETRY_SECONDS)
-            else:
-                logger.warning(
-                    "Follower %s#%s / master#%s never showed a settled entry price after %.1fs - "
-                    "skipping initial SL/TP for this fill",
-                    follower_account_id, follower_ticket, master_ticket,
-                    _PRICE_SETTLE_RETRIES * _PRICE_SETTLE_RETRY_SECONDS,
-                )
-                return
-
-            sl_distance, tp_distance = sl_tp_distance(
-                order_type=master_order["type"],
-                entry_price=master_entry,
-                sl=master_order.get("SL", 0),
-                tp=master_order.get("TP", 0),
-            )
-            if not sl_distance and not tp_distance:
-                return  
-
-            follower_sl, follower_tp = apply_sl_tp_distance(
-                order_type=follower_order["type"],
-                entry_price=follower_entry,
-                sl_distance=sl_distance,
-                tp_distance=tp_distance,
-            )
-            follower_agent.execute_modify(follower_ticket=follower_ticket, stop_loss=follower_sl, take_profit=follower_tp)
-            logger.info(
-                "Applied initial distance-based SL/TP: follower %s#%s -> SL=%.5f TP=%.5f",
-                follower_account_id, follower_ticket, follower_sl, follower_tp,
-            )
-            return

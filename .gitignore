@@ -3,6 +3,12 @@ copydesk_fanout/__pycache__/
 copydesk_fanout/*.env
 MetaTrader 5 IC Markets Global/
 MetaTrader 5/
+python/
+mql/
+java/
+dotnet/
+diagnostics/
+resources/
 __pycache__/
 *.pyc
 *.pyo
@@ -15,3 +21,4 @@ __pycache__/
 *.pyzwzw
 *.pyzwzwz
 *.pyzwzwzw
+*.md

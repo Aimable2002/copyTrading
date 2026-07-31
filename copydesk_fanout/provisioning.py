@@ -1,41 +1,3 @@
-"""
-Turns user-submitted MT5 credentials into a running, registered
-TerminalAgent/FollowerAgent - the automation layer from the "how does
-MetaApi do this" discussion: clone a pre-configured template terminal
-folder, write per-account login + EA-parameter files, launch the terminal
-in portable mode, wait for the EA to come alive, then wire it into the
-already-running FanoutCore the same way main.py wires up startup accounts.
-
-Required environment variables:
-  TEMPLATE_TERMINAL_DIR
-      Path to a ONE-TIME, manually prepared portable MT5 install:
-      DWX_Server_MT5.ex5 already dropped in MQL5/Experts/, the terminal's
-      AutoTrading toggle turned on, the EA's own "Allow Algo Trading"
-      ticked, then the terminal closed normally. That on/off state is
-      saved inside this folder's own files, so every clone inherits it -
-      this is the actual mechanism, not a config key (see the AutoTrading
-      conversation this was built from). This needs a one-time real check:
-      confirm a cloned copy with swapped credentials keeps that state on
-      your broker/build before relying on it for real users.
-  INSTANCES_DIR
-      Where per-account clones are created.
-  TERMINAL_EXECUTABLE_NAME
-      Filename only (not a path) of the terminal binary inside the cloned
-      instance dir, e.g. "terminal64.exe" for MT5. NOTE: portable mode
-      ties the data folder to wherever this exe physically lives - it is
-      NOT determined by /config: or the process's working directory. That
-      means every clone must run ITS OWN copy of the exe (already true,
-      since _clone_template() copies the whole template dir including the
-      binary) - launching one shared, fixed exe path for every account
-      would make every instance silently share the same data folder.
-
-Both EA-level order caps (MaximumOrders, MaximumLotSize) - which hard-
-REJECT orders past their default values regardless of what Supabase's
-subscription config says, see mql/DWX_Server_MT5.mq5 lines ~290 and ~319 -
-are overridden per-instance via a generated .set file, so Supabase's
-multiplier/sizing_mode stays the only real limiter.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -57,21 +19,14 @@ logger = logging.getLogger("provisioning")
 
 Role = Literal["master", "follower"]
 
-# High enough to never be the real limiter - Supabase's sizing config
-# (enforced in sizing.py) is meant to be the only thing that actually
-# constrains order count/size, not these EA-level inputs.
-_EA_MAX_ORDERS_OVERRIDE = 999
-_EA_MAX_LOT_SIZE_OVERRIDE = 100.0
+_ORDER_MAX_ORDERS = 999
+_ORDER_MAX_LOT_SIZE = 100.0
 
 _CONNECT_TIMEOUT_SECONDS = 45
 _CONNECT_POLL_SECONDS = 1.0
 
-# Second phase, only entered if the terminal process is still alive past
-# _CONNECT_TIMEOUT_SECONDS but hasn't connected yet - the "someone needs to
-# click Later on the LiveUpdate dialog" case. Not a failure by itself; see
-# _wait_fast / _wait_stalled.
 _STALLED_LOG_INTERVAL_SECONDS = 30
-_MAX_STALLED_WAIT_SECONDS = 1800  # 30 min upper bound - last-resort safety net, not a normal expectation
+_MAX_STALLED_WAIT_SECONDS = 1800 
 
 
 class ProvisioningError(Exception):
@@ -119,39 +74,54 @@ def _unlock_and_remove(instance_dir: Path) -> None:
     shutil.rmtree(instance_dir, ignore_errors=True)
 
 
-def _write_expert_parameters(instance_dir: Path) -> Path:
-    """Plain Name=Value per line - overrides the EA's hard-coded order
-    caps so they stop being the real limiter. NOTE: exact folder MT5
-    expects an ExpertParameters file in isn't 100% pinned down here -
-    verify this against a real launch before relying on it; if MT5 can't
-    find it, it silently falls back to the EA's compiled defaults
-    (MaximumOrders=1, MaximumLotSize=0.01), which is exactly the failure
-    mode we're trying to avoid."""
-    set_path = instance_dir / "provisioned.set"
-    set_path.write_text(
-        f"MaximumOrders={_EA_MAX_ORDERS_OVERRIDE}\n"
-        f"MaximumLotSize={_EA_MAX_LOT_SIZE_OVERRIDE}\n"
-    )
-    return set_path
+def _write_startup_config(instance_dir: Path, *, login: str, password: str, server: str) -> Path:
+    """Login-only startup config now - no [StartUp] Expert= section, since
+    there's no EA to attach. The terminal just needs to come up logged in
+    with AutoTrading on (see TEMPLATE_TERMINAL_DIR's one-time setup); the
+    Mt5Terminal sidecar's own mt5.initialize(login=..., password=...,
+    server=...) call is what actually establishes the account session
+    that matters for reads/writes - this file just gets the terminal UI
+    itself logged in on launch.
 
-
-def _write_startup_config(
-    instance_dir: Path, *, login: str, password: str, server: str, set_file: Path
-) -> Path:
+    This is also, deliberately, the ONLY place login/password/server get
+    persisted anywhere - never in Supabase. See read_provisioned_credentials()
+    below, which is how main.py recovers them on restart instead."""
     config_path = instance_dir / "provisioned_config.ini"
     config_path.write_text(
         "[Common]\n"
         f"Login={login}\n"
         f"Password={password}\n"
         f"Server={server}\n"
-        "\n"
-        "[StartUp]\n"
-        "Expert=DWX_Server_MT5\n"
-        "Symbol=EURUSD\n"
-        "Period=M1\n"
-        f"ExpertParameters={set_file.name}\n"
     )
     return config_path
+
+
+def read_provisioned_credentials(instance_dir: Path) -> tuple[str, str, str]:
+    """Reads login/password/server back out of provisioned_config.ini -
+    the reverse of _write_startup_config(). This is how main.py's Supabase
+    restart path gets credentials WITHOUT them ever being written to
+    Supabase - only terminal_path is persisted there; the instance folder
+    on disk (same machine the terminal itself lives on) is the sole
+    credential store, by design. Public (no leading underscore) since
+    main.py needs to call this directly.
+    """
+    config_path = instance_dir / "provisioned_config.ini"
+    if not config_path.exists():
+        raise ProvisioningError(
+            f"provisioned_config.ini not found in {instance_dir} - can't recover credentials "
+            f"for this account without it."
+        )
+    values: dict[str, str] = {}
+    for line in config_path.read_text().splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            values[key.strip().lower()] = value.strip()
+    try:
+        return values["login"], values["password"], values["server"]
+    except KeyError as exc:
+        raise ProvisioningError(
+            f"provisioned_config.ini in {instance_dir} is missing one of Login/Password/Server."
+        ) from exc
 
 
 def _launch_terminal(instance_dir: Path, config_path: Path) -> subprocess.Popen:
@@ -172,9 +142,39 @@ def _launch_terminal(instance_dir: Path, config_path: Path) -> subprocess.Popen:
     return proc
 
 
-def _metatrader_files_path(instance_dir: Path) -> str:
-    # Portable mode keeps the terminal's data folder inside its own install
-    # dir, so this is the same path dwx_client.py expects, just per-clone.
+def _terminal_exe_path(instance_dir: Path) -> str:
+    # Mt5Terminal's worker needs the exe path directly (mt5.initialize(path=...)),
+    # not a Files subfolder - there's no DWX file bridge left to point at.
+    exe_name = os.environ.get("TERMINAL_EXECUTABLE_NAME", "terminal64.exe")
+    return str(instance_dir / exe_name)
+
+
+def resolve_instance_dir(stored_path: str) -> Path:
+    """Turns whatever accounts.metatrader_dir_path holds into the real
+    instance root (the folder containing terminal64.exe and
+    provisioned_config.ini).
+
+    The frontend/DB convention keeps the legacy
+    instances/<account_id>/MQL5/Files suffix on this column (pre-dates the
+    move to a native mt5.initialize() connection, and isn't being changed -
+    other things depend on that shape) - so this strips that suffix back
+    down to the instance root rather than assuming the column already
+    holds the root or the exe path. Also tolerates a bare exe path or a
+    bare instance-root value, so nothing breaks if either of those ever
+    ends up in the column instead.
+    """
+    p = Path(stored_path)
+    if p.name.lower() == "files" and p.parent.name.upper() == "MQL5":
+        return p.parent.parent
+    if p.suffix.lower() == ".exe":
+        return p.parent
+    return p
+
+
+def _legacy_display_path(instance_dir: Path) -> str:
+    """Builds the MQL5\\Files-suffixed path this column has always stored,
+    so newly provisioned accounts keep writing the same shape the
+    frontend and existing rows already use - inverse of resolve_instance_dir()."""
     return str(instance_dir / "MQL5" / "Files")
 
 
@@ -204,7 +204,7 @@ def _wait_fast(agent: TerminalAgent, timeout: float = _CONNECT_TIMEOUT_SECONDS) 
         raise ProvisioningError(
             f"Terminal process for {agent.account_id} exited before connecting (exit code "
             f"{launched_process.returncode}) - check the launched terminal directly: bad "
-            f"credentials, AutoTrading off, or the EA failed to attach are the three usual causes."
+            f"credentials or the terminal's AutoTrading toggle being off are the usual causes."
         )
     return "stalled"
 
@@ -267,37 +267,44 @@ def generate_account_id(role: Role) -> str:
 def _start_terminal_and_agent(
     *, account_id: str, role: Role, login: str, password: str, server: str, fanout: FanoutCore,
 ) -> tuple[TerminalAgent, Path, str]:
-    """Clone, write per-account config, launch the terminal, construct and
-    start the agent. Does NOT wait for connection - see _wait_fast /
+    """Clone, write per-account login config, launch the terminal, construct
+    and start the agent. Does NOT wait for connection - see _wait_fast /
     _wait_stalled. On any failure here, cleans up the cloned instance dir
     and raises ProvisioningError; either this fully succeeds or it leaves
     no partial state behind."""
     instance_dir = _clone_template(account_id)
     try:
-        set_path = _write_expert_parameters(instance_dir)
-        config_path = _write_startup_config(
-            instance_dir, login=login, password=password, server=server, set_file=set_path
-        )
+        config_path = _write_startup_config(instance_dir, login=login, password=password, server=server)
         launched_process = _launch_terminal(instance_dir, config_path)
-        metatrader_dir_path = _metatrader_files_path(instance_dir)
+        terminal_path = _terminal_exe_path(instance_dir)
 
         agent: TerminalAgent
         if role == "master":
             agent = TerminalAgent(
                 account_id=account_id,
-                metatrader_dir_path=metatrader_dir_path,
+                terminal_path=terminal_path,
+                login=int(login),
+                password=password,
+                server=server,
+                max_orders=_ORDER_MAX_ORDERS,
+                max_lot_size=_ORDER_MAX_LOT_SIZE,
                 on_trade_event=fanout.handle_master_trade_event,
             )
         else:
             agent = FollowerAgent(
                 account_id=account_id,
-                metatrader_dir_path=metatrader_dir_path,
+                terminal_path=terminal_path,
+                login=int(login),
+                password=password,
+                server=server,
+                max_orders=_ORDER_MAX_ORDERS,
+                max_lot_size=_ORDER_MAX_LOT_SIZE,
                 on_trade_event=fanout.handle_follower_trade_event,
             )
 
         agent.start()
         agent.terminal_process = launched_process  # noqa: attribute added dynamically - see account_lifecycle.py's close_account
-        return agent, instance_dir, metatrader_dir_path
+        return agent, instance_dir, terminal_path
     except ProvisioningError:
         _unlock_and_remove(instance_dir)
         raise
@@ -308,7 +315,7 @@ def _start_terminal_and_agent(
 
 def finalize_provisioned_account(
     agent: TerminalAgent,
-    metatrader_dir_path: str,
+    terminal_path: str,
     *,
     user_id: str,
     role: Role,
@@ -325,7 +332,12 @@ def finalize_provisioned_account(
     terminal is actually confirmed connected - nothing partial gets
     registered before that. Public (no leading underscore) because
     api_server.py calls this directly for the fast/"connected" case
-    instead of going through provision_account_finish()."""
+    instead of going through provision_account_finish().
+
+    Deliberately does NOT write login/password/server to Supabase - only
+    terminal_path. Credentials live exclusively in provisioned_config.ini
+    on disk (see _write_startup_config/read_provisioned_credentials) -
+    main.py's restart path recovers them from there, not from this table."""
     if role == "master":
         fanout.register_master(agent)
     else:
@@ -339,7 +351,10 @@ def finalize_provisioned_account(
                 "account_id": account_id,
                 "user_id": user_id,
                 "role": role,
-                "metatrader_dir_path": metatrader_dir_path,
+                # Keep the MQL5\Files-suffixed shape the frontend/existing rows
+                # already use - resolve_instance_dir() is what strips it back
+                # off on the read side (main.py) to get the real exe path.
+                "metatrader_dir_path": _legacy_display_path(Path(terminal_path).parent),
                 "status": "live",
             }
         ).execute()
@@ -402,7 +417,7 @@ def provision_account(
         raise ProvisioningError("follower provisioning requires master_account_id, multiplier, sizing_mode")
 
     account_id = account_id or generate_account_id(role)
-    agent, instance_dir, metatrader_dir_path = _start_terminal_and_agent(
+    agent, instance_dir, terminal_path = _start_terminal_and_agent(
         account_id=account_id, role=role, login=login, password=password, server=server, fanout=fanout,
     )
 
@@ -415,9 +430,9 @@ def provision_account(
             raise
 
     finalize_provisioned_account(
-        agent, metatrader_dir_path,
-        user_id=user_id, role=role, account_id=account_id, fanout=fanout,
-        supabase_client=supabase_client, account_user_map=account_user_map, agents=agents,
+        agent, terminal_path,
+        user_id=user_id, role=role, account_id=account_id,
+        fanout=fanout, supabase_client=supabase_client, account_user_map=account_user_map, agents=agents,
         master_account_id=master_account_id, multiplier=multiplier, sizing_mode=sizing_mode,
     )
     return account_id
@@ -443,7 +458,7 @@ def provision_account_start(
     ProvisioningError immediately (a real, fast failure, same as before)
     if the process died within that window.
 
-    Returns (agent, instance_dir, metatrader_dir_path, outcome, account_id)
+    Returns (agent, instance_dir, terminal_path, outcome, account_id)
     so the caller can respond "live" right away if outcome == "connected"
     (via finalize_provisioned_account()), or "awaiting_attention" if
     outcome == "stalled" and hand the rest off to provision_account_finish()
@@ -453,17 +468,17 @@ def provision_account_start(
         raise ProvisioningError("follower provisioning requires master_account_id, multiplier, sizing_mode")
 
     account_id = account_id or generate_account_id(role)
-    agent, instance_dir, metatrader_dir_path = _start_terminal_and_agent(
+    agent, instance_dir, terminal_path = _start_terminal_and_agent(
         account_id=account_id, role=role, login=login, password=password, server=server, fanout=fanout,
     )
     outcome = _wait_fast(agent)
-    return agent, instance_dir, metatrader_dir_path, outcome, account_id
+    return agent, instance_dir, terminal_path, outcome, account_id
 
 
 def provision_account_finish(
     agent: TerminalAgent,
     instance_dir: Path,
-    metatrader_dir_path: str,
+    terminal_path: str,
     *,
     user_id: str,
     role: Role,
@@ -483,8 +498,7 @@ def provision_account_finish(
     provision_account()'s tail does. Raises ProvisioningError if the
     terminal dies during the wait or the max-wait is exceeded - there's no
     live HTTP request left at that point, so the caller (api_server.py) is
-    responsible for logging it rather than turning it into a response.
-    """
+    responsible for logging it rather than turning it into a response."""
     try:
         _wait_stalled(agent)
     except ProvisioningError:
@@ -492,8 +506,8 @@ def provision_account_finish(
         raise
 
     finalize_provisioned_account(
-        agent, metatrader_dir_path,
-        user_id=user_id, role=role, account_id=account_id, fanout=fanout,
-        supabase_client=supabase_client, account_user_map=account_user_map, agents=agents,
+        agent, terminal_path,
+        user_id=user_id, role=role, account_id=account_id,
+        fanout=fanout, supabase_client=supabase_client, account_user_map=account_user_map, agents=agents,
         master_account_id=master_account_id, multiplier=multiplier, sizing_mode=sizing_mode,
     )

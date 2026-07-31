@@ -19,9 +19,10 @@ Two modes, chosen automatically by --config vs --supabase:
     so an open copied trade survives a backend restart.
 
 Regardless of mode: each master/follower account must already be logged
-into its own running MT5 terminal with DWX_Server_MT5.mq5 attached to a
-chart (per the official dwxconnect README, or done automatically by the
-provisioning service in Supabase mode) before starting this.
+into its own running MT5 terminal with AutoTrading on (done automatically
+by the provisioning service - see provisioning.py). No EA/chart attachment
+needed anymore - execution and state both go through the native MT5
+connection (see mt5_terminal.py), not a file bridge.
 """
 
 from __future__ import annotations
@@ -68,7 +69,10 @@ def _run_local_file_mode(config_path: Path) -> None:
     for master_cfg in raw["accounts"]["masters"]:
         agent = TerminalAgent(
             account_id=master_cfg["account_id"],
-            metatrader_dir_path=master_cfg["metatrader_dir_path"],
+            terminal_path=master_cfg["terminal_path"],
+            login=master_cfg["login"],
+            password=master_cfg["password"],
+            server=master_cfg["server"],
             on_trade_event=fanout.handle_master_trade_event,
         )
         fanout.register_master(agent)
@@ -78,7 +82,10 @@ def _run_local_file_mode(config_path: Path) -> None:
     for follower_cfg in raw["accounts"]["followers"]:
         agent = FollowerAgent(
             account_id=follower_cfg["account_id"],
-            metatrader_dir_path=follower_cfg["metatrader_dir_path"],
+            terminal_path=follower_cfg["terminal_path"],
+            login=follower_cfg["login"],
+            password=follower_cfg["password"],
+            server=follower_cfg["server"],
             on_trade_event=fanout.handle_follower_trade_event,
         )
         fanout.register_follower(agent)
@@ -99,7 +106,10 @@ def _run_local_file_mode(config_path: Path) -> None:
 
 def _run_supabase_mode(serve: bool) -> None:
     # Local import: keeps `supabase` an optional dependency for local-file-mode-only use.
+    import os
+
     from .supabase_client import execute_with_retry, get_supabase_client
+    from .provisioning import ProvisioningError, read_provisioned_credentials, resolve_instance_dir
 
     supabase = get_supabase_client()
 
@@ -131,24 +141,84 @@ def _run_supabase_mode(serve: bool) -> None:
 
     agents: list[TerminalAgent] = []
     account_user_map: dict[str, str] = {}
+    skipped_accounts: list[str] = []
     for account in accounts:
         account_user_map[account["account_id"]] = account["user_id"]
+
+        # Credentials are never read from Supabase, by design - only
+        # metatrader_dir_path is persisted there. login/password/server
+        # live exclusively in provisioned_config.ini next to the terminal
+        # itself (see provisioning.py's _write_startup_config /
+        # read_provisioned_credentials), recovered here from disk on
+        # every restart instead.
+        #
+        # metatrader_dir_path keeps its original MQL5\Files-suffixed shape
+        # (frontend/existing rows depend on that convention) - it does NOT
+        # point straight at the instance root or the exe. resolve_instance_dir()
+        # strips that suffix back off to get the real instance root, and the
+        # exe path (what mt5.initialize() actually needs) is rebuilt from there.
+        stored_path = account["metatrader_dir_path"]
+        instance_dir = resolve_instance_dir(stored_path)
+
+        # A row can outlive its instance folder on THIS machine (deleted,
+        # never synced here, or provisioning interrupted before
+        # provisioned_config.ini got written). That's a per-account data
+        # problem, not a reason to take the whole fanout process down -
+        # skip just this account and keep starting up with whatever
+        # accounts are actually recoverable.
+        if not instance_dir.exists():
+            logger.warning(
+                "Skipping account %s (%s): instance dir not found on disk: %s. "
+                "This account will not be polled until its instance dir is restored "
+                "or the account is re-provisioned.",
+                account["account_id"], account["role"], instance_dir,
+            )
+            account_user_map.pop(account["account_id"], None)
+            skipped_accounts.append(account["account_id"])
+            continue
+
+        try:
+            login, password, server = read_provisioned_credentials(instance_dir)
+        except ProvisioningError as exc:
+            logger.warning(
+                "Skipping account %s (%s): %s",
+                account["account_id"], account["role"], exc,
+            )
+            account_user_map.pop(account["account_id"], None)
+            skipped_accounts.append(account["account_id"])
+            continue
+
+        exe_name = os.environ.get("TERMINAL_EXECUTABLE_NAME", "terminal64.exe")
+        terminal_path = str(instance_dir / exe_name)
+
         if account["role"] == "master":
             agent = TerminalAgent(
                 account_id=account["account_id"],
-                metatrader_dir_path=account["metatrader_dir_path"],
+                terminal_path=terminal_path,
+                login=int(login),
+                password=password,
+                server=server,
                 on_trade_event=fanout.handle_master_trade_event,
             )
             fanout.register_master(agent)
         else:
             agent = FollowerAgent(
                 account_id=account["account_id"],
-                metatrader_dir_path=account["metatrader_dir_path"],
+                terminal_path=terminal_path,
+                login=int(login),
+                password=password,
+                server=server,
                 on_trade_event=fanout.handle_follower_trade_event,
             )
             fanout.register_follower(agent)
         agents.append(agent)
         logger.info("Registered %s: %s", account["role"], account["account_id"])
+
+    if skipped_accounts:
+        logger.warning(
+            "Started up with %d account(s) skipped due to missing instance data: %s",
+            len(skipped_accounts), ", ".join(skipped_accounts),
+        )
 
     # NOTE: this still only registers agents that were `live` at startup -
     # dynamically adding an agent when a new account goes live mid-run
@@ -223,6 +293,22 @@ def _run_agents_with_server(
                 # and pick back up on the next interval instead.
                 logger.exception("Stale-pending sweep cycle failed - will retry next interval")
 
+    async def _close_retry_sweep(interval_seconds: float = 2.0) -> None:
+        """Backstop only - _attempt_close already retries a rejected close
+        immediately, inline, several times before this ever runs (see
+        fanout_core.py's _INLINE_CLOSE_RETRY_ATTEMPTS). This sweep exists
+        for the case where the broker is still rejecting after all of
+        those - e.g. the market/symbol itself is unavailable for a beat -
+        so it stays tight (2s) rather than the 15-30s cadence of the other
+        sweeps: this is real, un-hedged exposure sitting live."""
+        loop = asyncio.get_event_loop()
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                await loop.run_in_executor(None, fanout.retry_failed_closes)
+            except Exception:
+                logger.exception("Close-retry sweep cycle failed - will retry next interval")
+
     async def _billing_grace_sweep(interval_seconds: float = 300.0) -> None:
         """Closes any billing_period past its 5-day grace window. 5 minutes
         is plenty for a check whose actual threshold is measured in days -
@@ -283,6 +369,7 @@ def _run_agents_with_server(
                 run_live_state_publisher(fanout, account_user_map, supabase)
             ),
             "stale_pending_sweep": asyncio.create_task(_stale_pending_sweep()),
+            "close_retry_sweep": asyncio.create_task(_close_retry_sweep()),
             "billing_grace_sweep": asyncio.create_task(_billing_grace_sweep()),
             "profit_share_sweep": asyncio.create_task(_profit_share_sweep()),
         }
@@ -345,5 +432,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-    

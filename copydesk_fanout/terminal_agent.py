@@ -24,23 +24,31 @@ class ReconciliationResult:
     matched: set[str] = field(default_factory=set)
     closed_while_offline: set[str] = field(default_factory=set)
     new_while_offline: set[str] = field(default_factory=set)
-    live_orders: dict[str, dict] = field(default_factory=dict)  
+    live_orders: dict[str, dict] = field(default_factory=dict)
 
+# Both loops now read self.terminal.open_orders, an in-memory dict backed
+# by the Mt5Terminal sidecar (positions_get() under the hood) - no disk
+# I/O, so this can run tighter than the old file-poll interval without
+# adding real load.
+_ORDER_EVENT_POLL_SECONDS = 0.03
 _MODIFICATION_POLL_SECONDS = 0.03
 
 
 class TerminalAgent(BaseAgent):
-    def __init__(self, account_id: str, metatrader_dir_path: str, on_trade_event: TradeEventCallback, verbose: bool = True):
-        super().__init__(account_id, metatrader_dir_path, verbose=verbose)
+    def __init__(self, account_id: str, terminal_path: str, login: int, password: str, server: str,
+                 on_trade_event: TradeEventCallback, max_orders: int = 200, max_lot_size: float = 100.0,
+                 verbose: bool = True):
+        super().__init__(account_id, terminal_path, login, password, server,
+                          max_orders=max_orders, max_lot_size=max_lot_size, verbose=verbose)
         self._on_trade_event = on_trade_event
         self._last_orders: dict[str, dict] = {}
         self._last_full_snapshot: dict[str, dict] = {}
+        self._order_event_thread: threading.Thread | None = None
         self._modification_thread: threading.Thread | None = None
-        self._modification_thread_running = False
+        self._poll_threads_running = False
 
     def reconcile(self, expected_open_tickets: set[str]) -> ReconciliationResult:
-        self.dwx.load_orders()
-        live = dict(self.dwx.open_orders)
+        live = dict(self.terminal.open_orders)
         live_tickets = set(live.keys())
 
         matched = live_tickets & expected_open_tickets
@@ -76,17 +84,32 @@ class TerminalAgent(BaseAgent):
 
     def start(self) -> None:
         super().start()
-        self._modification_thread_running = True
+        self._poll_threads_running = True
+        self._order_event_thread = threading.Thread(target=self._order_event_poll_loop, daemon=True)
+        self._order_event_thread.start()
         self._modification_thread = threading.Thread(target=self._modification_poll_loop, daemon=True)
         self._modification_thread.start()
 
     def stop(self) -> None:
-        self._modification_thread_running = False
+        self._poll_threads_running = False
         super().stop()
 
+    def _order_event_poll_loop(self) -> None:
+        """Replaces what used to be dwx_client calling on_order_event()
+        for us whenever DWX_Orders.txt changed. Nothing pushes to us now
+        - self.terminal.open_orders is just a live property - so this
+        loop is what notices a ticket appeared or disappeared and raises
+        the same 'opened'/'closed' events fanout_core.py already expects.
+        """
+        while self._poll_threads_running:
+            time.sleep(_ORDER_EVENT_POLL_SECONDS)
+            try:
+                self.on_order_event()
+            except Exception:  # noqa: BLE001 - a poll-loop crash should not kill the whole agent
+                pass
+
     def on_order_event(self) -> None:
-        current = dict(self.dwx.open_orders)
-        print("DEBUG ON_ORDER_EVENT current :", current)
+        current = dict(self.terminal.open_orders)
 
         for ticket, order in current.items():
             if ticket not in self._last_orders:
@@ -99,7 +122,7 @@ class TerminalAgent(BaseAgent):
         self._last_orders = current
 
     def _modification_poll_loop(self) -> None:
-        while self._modification_thread_running:
+        while self._poll_threads_running:
             time.sleep(_MODIFICATION_POLL_SECONDS)
             try:
                 self._check_for_modifications()
@@ -107,7 +130,7 @@ class TerminalAgent(BaseAgent):
                 pass
 
     def _check_for_modifications(self) -> None:
-        current = dict(self.dwx.open_orders)
+        current = dict(self.terminal.open_orders)
 
         for ticket, order in current.items():
             previous = self._last_full_snapshot.get(ticket)
