@@ -355,12 +355,51 @@ def _handle_command(mt5_module, cmd_type: str, payload: dict) -> dict:
         return _order_result_to_dict(result)
 
     if cmd_type == "close_order":
+        if not mt5_module.symbol_select(payload["symbol"], True):
+            return {
+                "success": False,
+                "retcode": None,
+                "comment": f"symbol_select failed for {payload['symbol']}",
+            }
+
+        if not payload.get("close_price"):
+            tick = mt5_module.symbol_info_tick(payload["symbol"])
+            if tick is None:
+                return {
+                    "success": False,
+                    "retcode": None,
+                    "comment": f"symbol_info_tick returned None for {payload['symbol']}",
+                }
+            # Closing sends the OPPOSITE order type of the position - a
+            # closing SELL (against a long) fills at bid, a closing BUY
+            # (against a short) fills at ask.
+            is_closing_sell = payload["position_type"] == POSITION_TYPE_BUY
+            payload = {**payload, "close_price": tick.bid if is_closing_sell else tick.ask}
+
         request = build_close_request(**payload)
         result = mt5_module.order_send(request)
+        if result is None:
+            return {
+                "success": False,
+                "retcode": None,
+                "comment": f"order_send returned None, last_error={mt5_module.last_error()}",
+            }
         return _order_result_to_dict(result)
     if cmd_type == "modify_order":
+        if not mt5_module.symbol_select(payload["symbol"], True):
+            return {
+                "success": False,
+                "retcode": None,
+                "comment": f"symbol_select failed for {payload['symbol']}",
+            }
         request = build_modify_request(**payload)
         result = mt5_module.order_send(request)
+        if result is None:
+            return {
+                "success": False,
+                "retcode": None,
+                "comment": f"order_send returned None, last_error={mt5_module.last_error()}",
+            }
         return _order_result_to_dict(result)
     if cmd_type == "get_historic_trades":
         end = datetime.now(timezone.utc)
@@ -480,7 +519,18 @@ class Mt5Terminal:
     def close_order(self, ticket: int, lots: float = 0) -> dict:
         order = self.open_orders.get(str(ticket))
         if order is None:
-            return {"success": False, "retcode": None, "comment": f"ticket {ticket} not in open_orders"}
+            # Nothing to close - the position is already gone (closed
+            # manually, closed by a prior attempt whose result got lost,
+            # etc). The goal state "no open position for this ticket" is
+            # already true, so this is success, not a failure to retry -
+            # otherwise callers like FanoutCore's close-retry loop would
+            # keep re-attempting a close on a ticket that will never
+            # reappear in open_orders, forever.
+            return {
+                "success": True,
+                "retcode": None,
+                "comment": f"ticket {ticket} already not open - treating as closed",
+            }
         position_type = POSITION_TYPE_SELL if order["type"] == "sell" else POSITION_TYPE_BUY
         volume = lots if lots else order["lots"]
         return self._send_command("close_order", dict(

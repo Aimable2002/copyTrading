@@ -293,6 +293,22 @@ def _run_agents_with_server(
                 # and pick back up on the next interval instead.
                 logger.exception("Stale-pending sweep cycle failed - will retry next interval")
 
+    async def _close_retry_sweep(interval_seconds: float = 2.0) -> None:
+        """Backstop only - _attempt_close already retries a rejected close
+        immediately, inline, several times before this ever runs (see
+        fanout_core.py's _INLINE_CLOSE_RETRY_ATTEMPTS). This sweep exists
+        for the case where the broker is still rejecting after all of
+        those - e.g. the market/symbol itself is unavailable for a beat -
+        so it stays tight (2s) rather than the 15-30s cadence of the other
+        sweeps: this is real, un-hedged exposure sitting live."""
+        loop = asyncio.get_event_loop()
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                await loop.run_in_executor(None, fanout.retry_failed_closes)
+            except Exception:
+                logger.exception("Close-retry sweep cycle failed - will retry next interval")
+
     async def _billing_grace_sweep(interval_seconds: float = 300.0) -> None:
         """Closes any billing_period past its 5-day grace window. 5 minutes
         is plenty for a check whose actual threshold is measured in days -
@@ -353,6 +369,7 @@ def _run_agents_with_server(
                 run_live_state_publisher(fanout, account_user_map, supabase)
             ),
             "stale_pending_sweep": asyncio.create_task(_stale_pending_sweep()),
+            "close_retry_sweep": asyncio.create_task(_close_retry_sweep()),
             "billing_grace_sweep": asyncio.create_task(_billing_grace_sweep()),
             "profit_share_sweep": asyncio.create_task(_profit_share_sweep()),
         }

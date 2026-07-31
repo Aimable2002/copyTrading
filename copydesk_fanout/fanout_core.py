@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from .config_store import ConfigStore
 from .follower_agent import FollowerAgent
@@ -15,6 +16,21 @@ logger = logging.getLogger("fanout_core")
 # Below this, a partial-close reduction rounds to noise - just skip it
 # rather than send a broker a close command for 0.00 lots.
 _MIN_PARTIAL_CLOSE_LOTS = 0.01
+
+# A close that keeps failing past this many attempts almost always means
+# something the retry sweep can't fix on its own (symbol suspended,
+# invalid stops, account-level reject) - stop hammering the broker and
+# surface it as an error for a human instead.
+_MAX_CLOSE_RETRY_ATTEMPTS = 5
+
+# A rejected close on a LIVE position can't sit waiting for the next sweep
+# cycle - the market is still moving and every second is more slippage on
+# an un-hedged follower position. So a failure is retried immediately,
+# inline, right here, before ever falling back to the periodic sweep (the
+# sweep exists only to catch the case where the broker is still rejecting
+# after all of these - see retry_failed_closes below).
+_INLINE_CLOSE_RETRY_ATTEMPTS = 4
+_INLINE_CLOSE_RETRY_DELAY_SECONDS = 0.2
 
 
 class FanoutCore:
@@ -34,6 +50,10 @@ class FanoutCore:
         self.pair_store = pair_store
         self.master_agents: dict[str, TerminalAgent] = {}
         self.follower_agents: dict[str, FollowerAgent] = {}
+        # (master_account_id, master_ticket) -> set of follower_account_id
+        # whose close is still outstanding - see _attempt_close/retry_failed_closes.
+        self._pending_close_retries: dict[tuple[str, str], set[str]] = {}
+        self._close_retry_attempts: dict[tuple[str, str], int] = {}
 
     def register_master(self, agent: TerminalAgent) -> None:
         self.master_agents[agent.account_id] = agent
@@ -195,15 +215,91 @@ class FanoutCore:
             logger.info("Master %s closed %s but no confirmed follower fills to close", master_account_id, master_ticket)
             return
 
+        self._attempt_close(master_account_id, master_ticket, fills)
+
+    def _attempt_close(self, master_account_id: str, master_ticket: str, fills: dict) -> None:
+        """Sends execute_close for exactly the follower fills passed in -
+        the first attempt (_fan_out_close) passes every fill for this
+        master ticket; a retry (retry_failed_closes below) passes only
+        the subset that failed last time, so an already-confirmed-closed
+        follower on the same master ticket never gets a second close
+        command sent against a ticket that's no longer open."""
+        key = (master_account_id, master_ticket)
+        failed_followers: set[str] = set()
+
         for follower_account_id, fill in fills.items():
             follower_agent = self.follower_agents.get(follower_account_id)
             if follower_agent is None:
                 continue
-            follower_agent.execute_close(follower_ticket=fill.ticket)
+
+            result = follower_agent.execute_close(follower_ticket=fill.ticket)
+            inline_attempt = 1
+            while not result.get("success") and inline_attempt < _INLINE_CLOSE_RETRY_ATTEMPTS:
+                logger.warning(
+                    "Close rejected for follower %s#%s (master %s#%s closed) - retcode=%s comment=%s - "
+                    "retrying immediately (inline attempt %d/%d)",
+                    follower_account_id, fill.ticket, master_account_id, master_ticket,
+                    result.get("retcode"), result.get("comment"),
+                    inline_attempt + 1, _INLINE_CLOSE_RETRY_ATTEMPTS,
+                )
+                time.sleep(_INLINE_CLOSE_RETRY_DELAY_SECONDS)
+                result = follower_agent.execute_close(follower_ticket=fill.ticket)
+                inline_attempt += 1
+
+            if not result.get("success"):
+                failed_followers.add(follower_account_id)
+                logger.warning(
+                    "Close FAILED for follower %s#%s (master %s#%s closed) after %d immediate attempts - "
+                    "retcode=%s comment=%s - handing off to the retry sweep rather than dropping it",
+                    follower_account_id, fill.ticket, master_account_id, master_ticket,
+                    inline_attempt, result.get("retcode"), result.get("comment"),
+                )
+                continue
+
             logger.info("Closed copy: follower %s#%s (master %s#%s closed)",
                         follower_account_id, fill.ticket, master_account_id, master_ticket)
 
-        self.pair_store.remove_master_trade(master_account_id, master_ticket)
+        if failed_followers:
+            attempts = self._close_retry_attempts.get(key, 0) + 1
+            if attempts > _MAX_CLOSE_RETRY_ATTEMPTS:
+                logger.error(
+                    "Master %s#%s: follower(s) %s still failing to close after %d attempts - "
+                    "giving up on auto-retry, this needs manual attention. Pairing stays tracked.",
+                    master_account_id, master_ticket, sorted(failed_followers), attempts - 1,
+                )
+                self._pending_close_retries.pop(key, None)
+                self._close_retry_attempts.pop(key, None)
+                return
+            self._close_retry_attempts[key] = attempts
+            self._pending_close_retries[key] = failed_followers
+        else:
+            # Only drop the pairing once every follower fill for this
+            # master ticket actually confirmed closed.
+            self._pending_close_retries.pop(key, None)
+            self._close_retry_attempts.pop(key, None)
+            self.pair_store.remove_master_trade(master_account_id, master_ticket)
+
+    def retry_failed_closes(self) -> None:
+        """Call periodically (see main.py's _close_retry_sweep). Re-sends
+        the close only for follower tickets that actually failed on a
+        previous attempt - never the whole master trade again - so a
+        follower that already closed successfully on the same master
+        ticket doesn't get a redundant close command sent against a
+        ticket that's no longer open (close_order() would just report
+        'ticket not in open_orders', which looks identical to a real
+        failure and would wrongly reset the retry count)."""
+        for key, follower_ids in list(self._pending_close_retries.items()):
+            master_account_id, master_ticket = key
+            fills = self.pair_store.get_follower_fills(master_account_id, master_ticket)
+            retry_fills = {fid: fill for fid, fill in fills.items() if fid in follower_ids}
+            if not retry_fills:
+                # Pairing is gone by some other path - nothing left to retry.
+                self._pending_close_retries.pop(key, None)
+                self._close_retry_attempts.pop(key, None)
+                continue
+            logger.info("Retrying failed close: master %s#%s -> %d follower(s)",
+                        master_account_id, master_ticket, len(retry_fills))
+            self._attempt_close(master_account_id, master_ticket, retry_fills)
 
     def _fan_out_modify(self, master_account_id: str, master_ticket: str, master_order: dict) -> None:
         """
