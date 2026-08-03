@@ -3,10 +3,14 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from postgrest.exceptions import APIError
+
 from . import wallet
 from .supabase_client import execute_with_retry
 
 logger = logging.getLogger("roster")
+
+_ROSTER_SLOT_UNIQUE_VIOLATION = "23505"
 
 
 class RosterError(Exception):
@@ -83,17 +87,37 @@ def switch_master(
         )
 
     _clear_current(billing_period_id, follower_account_id, supabase_client)
-    insert_response = execute_with_retry(
-        lambda: supabase_client.table("roster_slots").insert(
-            {
-                "billing_period_id": billing_period_id,
-                "follower_account_id": follower_account_id,
-                "master_account_id": new_master_account_id,
-                "is_current": True,
-            }
-        ).execute()
-    )
-    new_slot_id = insert_response.data[0]["id"]
+    try:
+        insert_response = execute_with_retry(
+            lambda: supabase_client.table("roster_slots").insert(
+                {
+                    "billing_period_id": billing_period_id,
+                    "follower_account_id": follower_account_id,
+                    "master_account_id": new_master_account_id,
+                    "is_current": True,
+                }
+            ).execute()
+        )
+        new_slot_id = insert_response.data[0]["id"]
+    except APIError as exc:
+        if getattr(exc, "code", None) != _ROSTER_SLOT_UNIQUE_VIOLATION:
+            raise
+            
+        logger.warning(
+            "roster_slots insert raced for billing_period %s / master %s - "
+            "another request already created this slot, recovering.",
+            billing_period_id, new_master_account_id,
+        )
+        roster_after_race = get_roster(billing_period_id, follower_account_id, supabase_client)
+        winner = next((r for r in roster_after_race if r["master_account_id"] == new_master_account_id), None)
+        if winner is None:
+            raise RosterError(
+                "Switch conflicted with a concurrent request and the resulting slot could not be found - "
+                "please retry."
+            ) from exc
+        new_slot_id = winner["id"]
+        _set_current(billing_period_id, follower_account_id, new_slot_id, supabase_client)
+
     _sync_active_subscription(follower_account_id, new_master_account_id, supabase_client)
 
     return {
@@ -202,8 +226,6 @@ def _set_current(billing_period_id: str, follower_account_id: str, roster_slot_i
 
 
 def get_current_slot(billing_period_id: str, follower_account_id: str, supabase_client: Any) -> dict | None:
-    """What profit_share.py's poller uses to find which master a
-    follower's closed trades should be billed against."""
     response = execute_with_retry(
         lambda: (
             supabase_client.table("roster_slots")

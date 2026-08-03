@@ -707,12 +707,15 @@ class SARTradeEngine:
         self._open_new_position(newest.ticket, side, newest.price_open)
 
     # ------------------------------------------------------------------
-    # Trailing stop - armed dynamically, not by a config threshold: the
-    # SL stays fixed at entry -/+ distance (the original risk) until
-    # profit reaches that SAME distance - i.e. until you've made back
-    # exactly what you stood to lose. At that point the stop jumps to
-    # breakeven and the single trailing formula takes over, tightening
-    # only, for the rest of the position's life.
+    # Trailing stop - continuous, no arm/threshold. The SL is always
+    # (current_price - direction * pos.distance): pos.distance is the
+    # LOCKED distance computed once at entry (see _current_distance /
+    # _effective_distance_price - still the max of configured %, broker
+    # minimum, and spread safety floor, so the minimum-distance rule is
+    # untouched). What's removed is any waiting period - the candidate
+    # is recomputed and only ever tightened (max()/min(), never loosens)
+    # on every single tick from the moment the position opens, not just
+    # after profit first reaches 1x the risk distance.
     # ------------------------------------------------------------------
 
     def _apply_trailing(self, current_price: float) -> None:
@@ -720,20 +723,17 @@ class SARTradeEngine:
             return
         pos = self.position
         direction = 1 if pos.side == "BUY" else -1
-        profit_price = (current_price - pos.entry_price) * direction
 
-        if profit_price >= pos.distance:
-            if not pos.trail_armed:
-                pos.trail_armed = True
-                self._log(f"[{pos.side} {pos.ticket}] Trail armed - profit has matched the initial "
-                          f"risk distance ({pos.distance:.2f}); stop moves to breakeven and trails from here.")
-            candidate_sl = current_price - direction * pos.distance
-            if pos.side == "BUY":
-                pos.sl_price = max(pos.sl_price, candidate_sl)
-            else:
-                pos.sl_price = min(pos.sl_price, candidate_sl)
-        # else: not armed yet - sl_price stays exactly where it was set
-        # at entry (entry -/+ distance). Untouched, no partial trailing.
+        candidate_sl = current_price - direction * pos.distance
+        if pos.side == "BUY":
+            pos.sl_price = max(pos.sl_price, candidate_sl)
+        else:
+            pos.sl_price = min(pos.sl_price, candidate_sl)
+
+        if not pos.trail_armed:
+            pos.trail_armed = True
+            self._log(f"[{pos.side} {pos.ticket}] Trailing active from entry - stop follows price "
+                      f"continuously at a fixed {pos.distance:.2f} distance, tightening only.")
 
         crossed = (current_price <= pos.sl_price) if pos.side == "BUY" else (current_price >= pos.sl_price)
         if crossed:
