@@ -24,7 +24,7 @@ def _already_charged_this_week(follower_account_id: str, week_start_iso: str, su
     response = execute_with_retry(
         lambda: (
             supabase_client.table("weekly_charges")
-            .select("id")
+            .select("follower_account_id")
             .eq("follower_account_id", follower_account_id)
             .eq("week_start", week_start_iso)
             .execute()

@@ -5,51 +5,55 @@ Pure trading logic for the Stop-and-Reverse (SAR) bot. No printing, no
 colors, no prompts - this file only talks to MT5 and does math. Every
 threshold it uses comes from config.json; nothing is hardcoded.
 
-Strategy recap (R-multiplier risk model):
-  - On the very first run, a straddle (Buy Stop + Sell Stop) is placed
-    around price, sized by the same dynamic distance described below.
-  - This bot supports hedging-mode accounts, where a Buy and a Sell on
-    the same symbol can be open AT THE SAME TIME as two independent
-    positions (normal on a volatile symbol like BTCUSD - both straddle
-    legs can fill before the bot's next tick can cancel the sibling).
-    Positions are tracked as a collection keyed by ticket, NOT as a
-    single "the position" - every open position gets its own
-    independent entry, risk unit, stop level, and pending stop order.
-    A fill only ever affects that one position's tracked state.
+STRATEGY - exactly two rules, nothing else:
 
-  - RISK UNIT (R): computed fresh at the moment each position opens,
-    from the live spread - the same dynamic %-of-price distance
-    (adjusted for spread/broker minimums) already used to place the
-    straddle. Not a fixed pip count - it self-scales with price and
-    volatility. Every threshold below is a MULTIPLE of this position's
-    own R, not a pip value.
+  1. FLIP ONLY. There is exactly one position slot, ever - not a
+     collection, not "several tracked independently." self.position is
+     a single Optional[PositionState], structurally incapable of
+     representing more than one open trade. If the broker ever shows
+     more than one position for this symbol/magic (the account is
+     hedging-capable, so this CAN happen even though the strategy never
+     intends it - e.g. both initial straddle legs filling at once, or
+     the stop order filling while the old position hasn't been closed
+     yet), every position except the newest is closed at market
+     immediately, and if we were already tracking one when a new one
+     appears, that old one is treated as the flip trigger and closed
+     immediately too. The single-slot rule is enforced by the shape of
+     the data, not by cleanup logic bolted on afterward.
 
-  - HARD STOP-LOSS at 1R: from the moment a position opens (not after
-    it becomes profitable), if price moves stop_loss_r (default 1.0)
-    units of R against entry, the position is closed at market. This
-    is checked every tick regardless of anything else - it is what
-    actually limits the loss on a trade that never goes profitable.
+  2. ONE PRICE, PUSHED TO TWO PLACES: NATIVE SL AND THE PENDING ORDER.
+     Every open position has a real, broker-side stop-loss attached to
+     it directly (TRADE_ACTION_SLTP - the same SL MT5 shows in its own
+     S/L column), so protection is enforced by the exchange itself, not
+     only by this process polling price. The single pending order
+     (the stop-and-reverse order) is always kept at that EXACT SAME
+     price - never a separately-computed level. There is never more
+     than one live pending order for this symbol/magic (any extra is a
+     duplicate and gets cancelled). That one shared price sits at a
+     LOCKED, FIXED distance from the best price reached since entry -
+     computed once when the position opens from the live spread, and
+     never recalculated afterward. Every tick, the candidate stop level
+     is (current price - that fixed distance); if that candidate is
+     better than the current stop level, BOTH the native SL and the
+     pending order are moved to it together, in the same step - they
+     can never show two different numbers. It never loosens. There is
+     no separate "hard stop" phase versus "trail" phase - this single
+     rule IS the initial stop (on the very first tick, current price ~=
+     entry price, so the candidate is entry -/+ distance) and IS the
+     ongoing trail (as price moves favorably, the candidate keeps
+     improving). One formula, one price, two places it's written, from
+     the moment the position opens until it closes.
 
-  - TRAIL, armed at 1.5R: once profit reaches trail_arm_r (default 1.5)
-    multiples of R, the trail arms and the stop level jumps to lock in
-    (trail_arm_r - trail_buffer_r) R of profit. From then on the stop
-    level continuously trails (peak profit reached - trail_buffer_r) R
-    behind the best price seen - it only ever tightens, never loosens.
-    There is no fixed take-profit / no ceiling; a winning position can
-    run as far as price allows.
+  Because rule 2 makes the pending order nothing but this position's
+  stop-loss, and rule 1 allows only one position, the system cannot
+  represent two live trades protected by two different orders - there
+  is only ever one slot, one order, one distance.
 
-  - ONE ORDER, ONE NUMBER: there is exactly one pending stop order per
-    position, and it always sits at that position's current SL price -
-    never a separate "reversal order" at a different level. It is
-    simultaneously this position's exit trigger and the next
-    reversal's entry (on a hedging account, the order filling opens a
-    new, independent opposite position - it does NOT close this one;
-    the software price check above is what actually closes this one).
-    Every tick, for every open position, the bot verifies this order
-    exists and sits at the exact current SL price - if it's missing it
-    gets placed, if the level moved it gets repriced. This is a hard
-    invariant, not a best-effort retry: a position must never be left
-    with no live stop order under it.
+  MT5 IS THE SOURCE OF TRUTH, EVERY TICK: nothing here is inferred from
+  memory of what "should" be true. Every tick, the bot re-pulls the live
+  position and order list for this symbol/magic from MT5 and reconciles
+  its single tracked slot against that - never trusting a remembered
+  ticket without verifying it's still actually there.
 """
 
 from __future__ import annotations
@@ -59,7 +63,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, date
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 try:
     import MetaTrader5 as mt5
@@ -107,20 +111,17 @@ class DailyRisk:
 
 @dataclass
 class PositionState:
-    """Independent tracked state for exactly ONE open position. On a
-    hedging account there can be several of these live simultaneously
-    (e.g. a BUY and a SELL on the same symbol at once) - each one owns
-    its own risk unit, stop level, and pending stop order, and nothing
-    here is ever shared across positions."""
+    """The ONE currently-open position, if any. self.position on the
+    engine is Optional[PositionState] - never a collection - so the data
+    itself makes 'two positions at once' unrepresentable."""
     ticket: int
     side: str                              # "BUY" | "SELL"
     entry_price: float
-    risk_price: float                      # 1R in price units, fixed at entry
-    sl_price: float                        # current stop level (moves once trail arms)
-    trail_armed: bool = False
-    peak_profit_r: float = 0.0
+    distance: float                        # locked fixed distance in price units, set once at entry, never recalculated
+    sl_price: float                        # current stop level - only ever tightens
     stop_order_ticket: Optional[int] = None
     last_stop_order_attempt: float = 0.0
+    trail_armed: bool = False              # log-dedup only - the arm CONDITION is recomputed fresh every tick
 
 
 class SARTradeEngine:
@@ -137,12 +138,6 @@ class SARTradeEngine:
         self.slippage: int = config["trading"]["slippage_points"]
         self.comment: str = config["trading"].get("comment", "SAR-BOT")
 
-        # R-multiplier risk model - see module docstring. All three are
-        # multiples of a position's own dynamically-computed R, never pips.
-        self.stop_loss_r: float = config["protection"].get("stop_loss_r", 1.0)
-        self.trail_arm_r: float = config["protection"].get("trail_arm_r", 1.5)
-        self.trail_buffer_r: float = config["protection"].get("trail_buffer_r", 0.5)
-
         self.max_dd_usd: float = config["risk"]["max_daily_drawdown_usd"]
         self.target_usd: float = config["risk"]["daily_profit_target_usd"]
         self.stop_on_dd: bool = config["risk"]["stop_trading_on_drawdown_hit"]
@@ -150,13 +145,12 @@ class SARTradeEngine:
 
         self.poll_interval: float = config["engine"]["poll_interval_seconds"]
 
-        # runtime state - every open position tracked independently,
-        # keyed by its MT5 ticket. See PositionState docstring above.
-        self.positions: Dict[int, PositionState] = {}
+        # ---- Rule 1: exactly one slot, ever - never a collection ----
+        self.position: Optional[PositionState] = None
 
         # The initial straddle's two pending orders exist BEFORE any
-        # position is open, so they're not owned by any PositionState -
-        # tracked separately here until the first fill(s) consume them.
+        # position is open, so they're not owned by the single position
+        # slot - tracked separately here until the first fill consumes it.
         self.pending_straddle_tickets: List[int] = []
 
         # Once we discover which ORDER_FILLING_* mode this broker/symbol
@@ -282,18 +276,12 @@ class SARTradeEngine:
 
     def _send_order_with_filling_retry(self, request: Dict[str, Any]) -> Any:
         """Sends an order, mutating request['type_filling'] and retrying if
-        the broker rejects the mode as unsupported.
-
-        MT5 does not give a reliable way to know in advance which fill mode
-        a given symbol/broker wants (this varies a lot for crypto CFDs), so
-        instead of hardcoding one mode everywhere we try the mode that has
-        already worked for this symbol first (once we've found it), and
-        otherwise fall through IOC -> FOK -> RETURN. We only burn a retry
-        when the rejection reason is specifically the filling mode
-        (TRADE_RETCODE_INVALID_FILL) - any other rejection (bad price, no
-        money, market closed, etc.) will fail identically on every mode, so
-        we log it and return immediately instead of retrying pointlessly.
-        """
+        the broker rejects the mode as unsupported. Different brokers/
+        symbols (crypto CFDs especially) accept different fill modes, so
+        we try the mode that's already worked for this symbol first, then
+        fall through IOC -> FOK -> RETURN. Only retries when the specific
+        rejection is TRADE_RETCODE_INVALID_FILL - anything else fails
+        identically on every mode."""
         if not MT5_AVAILABLE:
             return None
 
@@ -324,11 +312,9 @@ class SARTradeEngine:
         return last_result
 
     def get_min_stop_distance_price(self) -> float:
-        """Reads the broker's actual minimum distance (in price units) that a
-        pending order must sit away from current price. Returns 0.0 if MT5
-        isn't available or the broker reports no explicit restriction (common
-        on raw/ECN accounts - it does NOT mean zero distance is safe, the
-        spread itself still enforces a real floor, handled separately below)."""
+        """Broker's actual minimum distance (price units) a pending order
+        must sit away from current price. 0.0 if unavailable/unrestricted
+        (the spread itself still enforces a real floor, handled separately)."""
         if not MT5_AVAILABLE or not self._connected:
             return 0.0
         info = mt5.symbol_info(self.symbol)
@@ -341,15 +327,14 @@ class SARTradeEngine:
         return broker_min_points * point
 
     def _effective_distance_price(self, mid_price: float, spread: float) -> float:
-        """Distance (in price units) used for the initial straddle, and as
-        the RISK UNIT (1R) for every position once it fills. Percentage-of-
-        price is the primary driver so it self-scales across symbols and
-        price regimes instead of a fixed dollar/pip number going stale. The
-        final distance is the LARGEST of:
-          - percent_of_price  (your configured % target)
-          - broker's reported minimum (trade_stops_level/freeze_level)
-          - current spread * a safety multiplier (a stop closer than the
-            spread itself is structurally invalid - it lands inside bid/ask)
+        """Distance (price units) used for the initial straddle, and as the
+        LOCKED fixed distance for a position's stop once it fills.
+        Percentage-of-price is the primary driver so it self-scales across
+        symbols/price regimes. Final distance is the LARGEST of:
+          - percent_of_price  (configured %)
+          - broker's reported minimum
+          - current spread * safety multiplier (a stop closer than the
+            spread is structurally invalid)
         """
         percent = self.initial_distance_percent / 100.0
         percent_distance = mid_price * percent
@@ -367,10 +352,10 @@ class SARTradeEngine:
             )
         return effective
 
-    def _current_r_distance(self) -> Optional[float]:
-        """Computes 1R fresh, right now, from the live spread. Used both for
-        sizing the initial straddle and for sizing each new position's own
-        risk unit at the moment it fills."""
+    def _current_distance(self) -> Optional[float]:
+        """Computes the locked distance fresh, right now, from the live
+        spread - used once, at the moment a position opens, and then never
+        recalculated for that position's lifetime."""
         quote = self.get_bid_ask()
         if quote is None:
             return None
@@ -379,14 +364,46 @@ class SARTradeEngine:
         mid = (bid + ask) / 2.0
         return self._effective_distance_price(mid, spread)
 
+    def _min_valid_order_distance(self, spread: float) -> float:
+        broker_min = self.get_min_stop_distance_price()
+        spread_floor = spread * self.spread_safety_multiplier
+        return max(broker_min, spread_floor)
+
+    def _valid_stop_order_price(self, side: str, target_price: float) -> Optional[float]:
+        """Clamps target_price to the nearest price the broker will
+        actually accept, checked against LIVE bid/ask right now - never
+        trust a price computed a moment ago, since price moves between
+        when it was set and when the order is actually sent."""
+        quote = self.get_bid_ask()
+        if quote is None:
+            return None
+        bid, ask = quote
+        spread = ask - bid
+        min_dist = self._min_valid_order_distance(spread)
+
+        if side == "BUY":  # protecting order is a SELL STOP, must clear bid by min_dist
+            boundary = bid - min_dist
+            valid_price = min(target_price, boundary)
+        else:  # SELL position -> BUY STOP, must clear ask by min_dist
+            boundary = ask + min_dist
+            valid_price = max(target_price, boundary)
+
+        valid_price = round(valid_price, 2)
+        if abs(valid_price - round(target_price, 2)) > 1e-9:
+            self._log(f"Desired stop price {target_price:.2f} was too close to live bid/ask - "
+                      f"using {valid_price:.2f} instead (closest valid price).")
+        return valid_price
+
+    # ------------------------------------------------------------------
+    # Initial straddle (pre-position bootstrapping only)
+    # ------------------------------------------------------------------
+
     def place_straddle(self, mid_price: float) -> None:
-        """First-run only (no positions open, no straddle already pending):
+        """First-run only (no position open, no straddle already pending):
         place both Buy Stop and Sell Stop around price, sized by the same
-        dynamic distance that becomes each fill's risk unit (R). Anchored
-        off real bid/ask (not the midpoint) so the orders always land on
-        the valid side of the current spread. NOTE: on a hedging account
-        both legs can fill - that's expected, _on_fill tracks each as its
-        own independent position with its own R."""
+        dynamic distance that becomes the fill's locked stop distance.
+        Anchored off real bid/ask so orders land on the valid side of the
+        current spread."""
         quote = self.get_bid_ask()
         if quote is None:
             self._log("Cannot place straddle - no live bid/ask available.")
@@ -426,25 +443,20 @@ class SARTradeEngine:
         self._order_send(req)
 
     def cancel_straddle_pending(self) -> None:
-        """Cancels whatever's left of the initial straddle (the leg that
-        didn't fill). Only ever touches the pre-position straddle orders -
-        never a specific position's own stop order, which lives for as
-        long as that position does (see _ensure_stop_orders)."""
         for t in list(self.pending_straddle_tickets):
             self.cancel_pending(t)
         self.pending_straddle_tickets.clear()
 
     # ------------------------------------------------------------------
-    # The single per-position stop order - placed at entry, kept pinned
-    # to sl_price every tick for as long as the position is open.
+    # Rule 2: one price (pos.sl_price), pushed to two places every tick -
+    # the position's native broker-side SL and the single pending order.
     # ------------------------------------------------------------------
 
-    def _place_stop_order(self, pos: PositionState) -> Optional[int]:
-        """Places the ONE pending stop order for this position, at its
-        current sl_price. Opposite side of the position, since it is both
-        this position's exit trigger and the next reversal's entry."""
+    def _place_stop_order(self, pos: PositionState, valid_price: float) -> Optional[int]:
+        """Places THE ONE pending order for the current position, at the
+        exact same already-validated price just applied to its native SL."""
         if not MT5_AVAILABLE:
-            self._log(f"[SIMULATED] Stop order placed at {pos.sl_price:.2f} for {pos.side} {pos.ticket}")
+            self._log(f"[SIMULATED] Stop order placed at {valid_price:.2f} for {pos.side} {pos.ticket}")
             return None
 
         order_type = mt5.ORDER_TYPE_SELL_STOP if pos.side == "BUY" else mt5.ORDER_TYPE_BUY_STOP
@@ -455,84 +467,120 @@ class SARTradeEngine:
             magic=self.magic,
             comment=self.comment,
             type=order_type,
-            price=round(pos.sl_price, 2),
+            price=valid_price,
             type_time=mt5.ORDER_TIME_GTC,
         )
         r = self._send_order_with_filling_retry(req)
         if r and r.retcode == mt5.TRADE_RETCODE_DONE:
-            self._log(f"[{pos.side} {pos.ticket}] Stop order placed at {pos.sl_price:.2f}")
+            self._log(f"[{pos.side} {pos.ticket}] Stop order placed at {valid_price:.2f}")
             return r.order
 
-        self._log(f"[{pos.side} {pos.ticket}] Stop order FAILED at {pos.sl_price:.2f} - "
+        self._log(f"[{pos.side} {pos.ticket}] Stop order FAILED at {valid_price:.2f} - "
                   f"position has NO live stop order right now. Will retry.")
         return None
 
-    def _sync_stop_order_price(self, pos: PositionState) -> None:
-        """Verifies the tracked stop order still exists and sits exactly at
-        sl_price; reprices it if the trail has moved, clears the ticket if
-        the order is gone so _ensure_stop_orders places a fresh one next."""
-        if not MT5_AVAILABLE:
-            return
-        orders = mt5.orders_get(ticket=pos.stop_order_ticket)
-        if not orders:
-            # Gone - either it filled (the resulting reversal position will
-            # show up in _detect_fills on its own) or was cancelled/expired
-            # externally. Either way this position is no longer verified as
-            # protected, so drop the ticket and let _ensure_stop_orders
-            # place a fresh one immediately.
-            pos.stop_order_ticket = None
-            return
+    def _sync_native_sl(self, pos: PositionState, valid_price: float) -> None:
+        """Ensures the position's own broker-side SL (TRADE_ACTION_SLTP -
+        the same S/L MT5 shows natively on the position) matches
+        valid_price. Read fresh from MT5's live position record every
+        tick, never trusted from memory. This is real, exchange-enforced
+        protection: it keeps working even if this process crashes or
+        disconnects, unlike the pending order alone."""
+        live = [p for p in (mt5.positions_get(symbol=self.symbol) or [])
+                if p.ticket == pos.ticket and p.magic == self.magic]
+        if not live:
+            return  # position's gone - _reconcile_position will notice and clear tracking
 
-        order = orders[0]
-        target_price = round(pos.sl_price, 2)
-        if abs(order.price_open - target_price) < 1e-9:
-            return  # already correct, nothing to do
+        broker_sl = live[0].sl
+        if broker_sl and abs(broker_sl - valid_price) < 1e-9:
+            return  # already correct
 
-        req = dict(action=mt5.TRADE_ACTION_MODIFY, order=pos.stop_order_ticket, price=target_price)
+        req = dict(action=mt5.TRADE_ACTION_SLTP, symbol=self.symbol, position=pos.ticket,
+                   sl=valid_price, tp=0.0)
         result = self._order_send(req)
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            self._log(f"[{pos.side} {pos.ticket}] Stop order moved to {target_price:.2f}")
+            self._log(f"[{pos.side} {pos.ticket}] Native SL set to {valid_price:.2f}")
         else:
-            self._log(f"[{pos.side} {pos.ticket}] Failed to move stop order to {target_price:.2f} - will retry.")
+            self._log(f"[{pos.side} {pos.ticket}] Failed to set native SL to {valid_price:.2f} - will retry.")
 
-    def _ensure_stop_orders(self) -> None:
-        """Hard invariant, checked every tick: every open position must
-        have a live pending stop order sitting exactly at its current
-        sl_price. Missing -> place it. Stale price -> reprice it. This is
-        what closes the 'naked position' gap - it's not a best-effort
-        retry loop, it runs unconditionally every tick for every position."""
+    def _sync_protection(self) -> None:
+        """MT5 is the source of truth - not a remembered ticket or a
+        remembered SL value. Every tick: compute ONE valid price from
+        pos.sl_price, push it to the native SL AND the pending order in
+        the same step (never one without the other), then sweep away
+        anything else live - there is structurally no legitimate reason
+        for a second order, or a mismatched SL, to exist."""
+        if not MT5_AVAILABLE:
+            return
+
+        straddle_set = set(self.pending_straddle_tickets)
+
+        if self.position is None:
+            # No position -> no legitimate non-straddle order can exist.
+            live_orders = [o for o in (mt5.orders_get(symbol=self.symbol) or [])
+                           if o.magic == self.magic and o.ticket not in straddle_set]
+            for o in live_orders:
+                self._log(f"Orphan pending order {o.ticket} at {o.price_open:.2f} found with no open "
+                          f"position - cancelling.")
+                self.cancel_pending(o.ticket)
+            return
+
+        pos = self.position
+        valid_price = self._valid_stop_order_price(pos.side, pos.sl_price)
+        if valid_price is None:
+            self._log(f"[{pos.side} {pos.ticket}] Cannot sync protection - no live bid/ask available.")
+            return
+
+        # --- Native SL first ---
+        self._sync_native_sl(pos, valid_price)
+
+        # --- Pending order, same price ---
         now = time.time()
-        for pos in list(self.positions.values()):
-            if pos.stop_order_ticket is None:
-                if now - pos.last_stop_order_attempt < self._stop_order_retry_interval_seconds:
-                    continue
+        live_orders = [o for o in (mt5.orders_get(symbol=self.symbol) or [])
+                       if o.magic == self.magic and o.ticket not in straddle_set]
+        order_by_ticket = {o.ticket: o for o in live_orders}
+        order = order_by_ticket.get(pos.stop_order_ticket) if pos.stop_order_ticket is not None else None
+
+        if order is not None:
+            if abs(order.price_open - valid_price) > 1e-9:
+                req = dict(action=mt5.TRADE_ACTION_MODIFY, order=pos.stop_order_ticket, price=valid_price)
+                result = self._order_send(req)
+                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                    self._log(f"[{pos.side} {pos.ticket}] Pending order moved to {valid_price:.2f}")
+                else:
+                    self._log(f"[{pos.side} {pos.ticket}] Failed to move pending order to {valid_price:.2f} - will retry.")
+        else:
+            pos.stop_order_ticket = None
+            if now - pos.last_stop_order_attempt >= self._stop_order_retry_interval_seconds:
                 pos.last_stop_order_attempt = now
-                pos.stop_order_ticket = self._place_stop_order(pos)
-            else:
-                self._sync_stop_order_price(pos)
+                pos.stop_order_ticket = self._place_stop_order(pos, valid_price)
+
+        # Anything live that isn't a straddle leg and isn't THE current
+        # order is a duplicate/orphan - cancel it now. There is only ever
+        # supposed to be one.
+        for o in live_orders:
+            if o.ticket != pos.stop_order_ticket:
+                self._log(f"Duplicate/orphan pending order {o.ticket} at {o.price_open:.2f} - cancelling "
+                          f"(only one order is allowed to exist for the current position).")
+                self.cancel_pending(o.ticket)
+
+    # ------------------------------------------------------------------
+    # Closing
+    # ------------------------------------------------------------------
 
     def close_position_by_ticket(self, ticket: int, reason: str) -> bool:
-        """Closes exactly ONE position, identified by ticket - never
-        anything else that happens to be open at the same time. Returns
-        True only once we've confirmed that specific ticket is flat.
-
-        Deliberately does NOT cancel that position's stop order: it sits
-        exactly at the level price just crossed, so it is very likely
-        about to fill (or may already have) into the natural reversal
-        position - that's the whole point of stop-and-reverse. Leaving it
-        live also means a crashed/disconnected bot process still leaves a
-        real order working on the broker's side."""
+        """Closes exactly one position by ticket. Returns True only once
+        confirmed flat. Does not touch pending orders - _reconcile_*
+        handles cleanup of whatever's left every tick regardless of why a
+        position closed."""
         if not MT5_AVAILABLE:
             self._log(f"[SIMULATED] Position {ticket} closed at market ({reason})")
-            self.positions.pop(ticket, None)
             return True
 
-        positions = mt5.positions_get(ticket=ticket)
+        positions = [p for p in (mt5.positions_get(symbol=self.symbol) or [])
+                     if p.ticket == ticket and p.magic == self.magic]
         if not positions:
-            # Already gone on the broker's side (closed manually, stopped
-            # out, etc.) - bring our tracking in line with reality.
-            self.positions.pop(ticket, None)
-            return True
+            return True  # already gone on the broker's side
 
         pos = positions[0]
         price = self.get_price()
@@ -552,108 +600,112 @@ class SARTradeEngine:
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
             self._log(f"Close order FAILED for ticket {ticket} ({reason}) - "
                       f"position is still OPEN on the broker. Will retry next tick.")
-            # Leave this position's tracked state exactly as-is so
-            # _apply_protection tries again next tick - and leave every
-            # OTHER open position completely untouched.
             return False
 
         self._log(f"Position {ticket} closed at market ({reason})")
-        self.positions.pop(ticket, None)
         return True
 
     # ------------------------------------------------------------------
-    # Fill detection & the stop-and-reverse transition
+    # Rule 1: exactly one position slot - reconciled against MT5 every
+    # tick, never inferred. A new position appearing while one was
+    # already tracked IS the flip: close the old one immediately.
     # ------------------------------------------------------------------
 
-    def _detect_fills(self) -> List[Tuple[int, str, float]]:
-        """Returns a list of (ticket, side, entry_price) for every position
-        that's open on the broker and not yet in self.positions. Returns
-        every new fill found, not just the first - on a hedging account a
-        fast move can fill both straddle legs (or several stop orders)
-        within a single tick, and every one of them needs its own tracked
-        state."""
-        if not MT5_AVAILABLE:
-            return []
-        positions = mt5.positions_get(symbol=self.symbol)
-        if not positions:
-            return []
-        new_fills: List[Tuple[int, str, float]] = []
-        for pos in positions:
-            if pos.magic != self.magic:
-                continue
-            if pos.ticket in self.positions:
-                continue
-            side = "BUY" if pos.type == mt5.POSITION_TYPE_BUY else "SELL"
-            new_fills.append((pos.ticket, side, pos.price_open))
-        return new_fills
+    def _open_new_position(self, ticket: int, side: str, entry_price: float) -> None:
+        self._log(f"New position: {side} {ticket} @ {entry_price}")
 
-    def _on_fill(self, ticket: int, side: str, entry_price: float) -> None:
-        """Sets up independent tracked state for exactly one newly-opened
-        position: computes its own R fresh from the live spread, sets the
-        initial hard stop-loss at stop_loss_r, and leaves stop_order_ticket
-        unset so _ensure_stop_orders places it this same tick. Never
-        touches any other position's state."""
-        self._log(f"Fill detected: new {side} position {ticket} @ {entry_price}")
-
-        r = self._current_r_distance()
-        if r is None or r <= 0:
-            # Shouldn't normally happen since we just traded this symbol,
-            # but guard against a bad tick so the position still gets SOME
-            # protection instead of none - and make it loud in the log.
-            r = entry_price * 0.0005
-            self._log(f"[{side} {ticket}] WARNING: could not read live spread to compute the risk "
-                      f"unit - using fallback R={r:.2f}. Verify this position's stop manually.")
+        dist = self._current_distance()
+        if dist is None or dist <= 0:
+            dist = entry_price * 0.0005
+            self._log(f"[{side} {ticket}] WARNING: could not read live spread to compute the stop "
+                      f"distance - using fallback {dist:.2f}. Verify this position's stop manually.")
 
         direction = 1 if side == "BUY" else -1
-        sl_price = entry_price - direction * self.stop_loss_r * r
+        sl_price = entry_price - direction * dist
 
-        self.positions[ticket] = PositionState(
+        self.position = PositionState(
             ticket=ticket, side=side, entry_price=entry_price,
-            risk_price=r, sl_price=sl_price,
+            distance=dist, sl_price=sl_price,
         )
 
+    def _reconcile_position(self) -> None:
+        """MT5 is the source of truth. Pulls the live position list for
+        this symbol/magic and reconciles the single tracked slot against
+        it - never assuming what should be true from a previous tick."""
+        if not MT5_AVAILABLE:
+            return
+
+        broker_positions = [p for p in (mt5.positions_get(symbol=self.symbol) or [])
+                             if p.magic == self.magic]
+
+        tracked_ticket = self.position.ticket if self.position is not None else None
+        others = [p for p in broker_positions if p.ticket != tracked_ticket]
+
+        if self.position is not None and not any(p.ticket == tracked_ticket for p in broker_positions):
+            # Our tracked position is gone from the broker (we closed it,
+            # a human closed it, or - since there's no broker-side SL -
+            # this can only otherwise happen via our own market close).
+            self._log(f"Position {tracked_ticket} is no longer open on the broker - clearing tracking.")
+            self.position = None
+
+        if not others:
+            return
+
+        # One or more OTHER positions exist. Keep only the newest (MT5
+        # tickets increase monotonically); close every other one at
+        # market immediately - including our previously-tracked position
+        # if it's still open, since a new position appearing IS the flip.
+        newest = max(others, key=lambda p: p.ticket)
+
+        if self.position is not None:
+            self._log(f"Flip: new position {newest.ticket} appeared while {self.position.ticket} "
+                      f"was still open - closing {self.position.ticket} now.")
+            self.close_position_by_ticket(self.position.ticket, reason="flip")
+            self.position = None
+
+        for p in others:
+            if p.ticket != newest.ticket:
+                self._log(f"More than one new position appeared at once ({p.ticket}) - "
+                          f"closing it, only the newest ({newest.ticket}) is kept.")
+                self.close_position_by_ticket(p.ticket, reason="duplicate")
+
+        side = "BUY" if newest.type == mt5.POSITION_TYPE_BUY else "SELL"
+        self._open_new_position(newest.ticket, side, newest.price_open)
+
     # ------------------------------------------------------------------
-    # Protection: hard stop-loss at 1R + trail armed at 1.5R with a
-    # 0.5R buffer (all multiples of that position's own R - run every
-    # tick, per independently-tracked position)
+    # Trailing stop - armed dynamically, not by a config threshold: the
+    # SL stays fixed at entry -/+ distance (the original risk) until
+    # profit reaches that SAME distance - i.e. until you've made back
+    # exactly what you stood to lose. At that point the stop jumps to
+    # breakeven and the single trailing formula takes over, tightening
+    # only, for the rest of the position's life.
     # ------------------------------------------------------------------
 
-    def _profit_r_for(self, pos: PositionState, current_price: float) -> float:
+    def _apply_trailing(self, current_price: float) -> None:
+        if self.position is None:
+            return
+        pos = self.position
         direction = 1 if pos.side == "BUY" else -1
-        if pos.risk_price <= 0:
-            return 0.0
-        return ((current_price - pos.entry_price) * direction) / pos.risk_price
+        profit_price = (current_price - pos.entry_price) * direction
 
-    def _apply_protection(self, current_price: float) -> None:
-        # list(...) because closing a position mutates self.positions
-        # mid-iteration.
-        for pos in list(self.positions.values()):
-            direction = 1 if pos.side == "BUY" else -1
-            profit_r = self._profit_r_for(pos, current_price)
-            pos.peak_profit_r = max(pos.peak_profit_r, profit_r)
-            tag = f"[{pos.side} {pos.ticket}]"
-
-            # --- Arm the trail once profit reaches trail_arm_r ---
-            if not pos.trail_armed and profit_r >= self.trail_arm_r:
+        if profit_price >= pos.distance:
+            if not pos.trail_armed:
                 pos.trail_armed = True
-                self._log(f"{tag} Trail armed at {profit_r:.2f}R")
+                self._log(f"[{pos.side} {pos.ticket}] Trail armed - profit has matched the initial "
+                          f"risk distance ({pos.distance:.2f}); stop moves to breakeven and trails from here.")
+            candidate_sl = current_price - direction * pos.distance
+            if pos.side == "BUY":
+                pos.sl_price = max(pos.sl_price, candidate_sl)
+            else:
+                pos.sl_price = min(pos.sl_price, candidate_sl)
+        # else: not armed yet - sl_price stays exactly where it was set
+        # at entry (entry -/+ distance). Untouched, no partial trailing.
 
-            # --- While armed, sl_price continuously = peak - buffer, in R ---
-            if pos.trail_armed:
-                locked_r = pos.peak_profit_r - self.trail_buffer_r
-                candidate_sl = pos.entry_price + direction * locked_r * pos.risk_price
-                # Only ever tighten (move favorably) - never loosen.
-                if pos.side == "BUY":
-                    pos.sl_price = max(pos.sl_price, candidate_sl)
-                else:
-                    pos.sl_price = min(pos.sl_price, candidate_sl)
-
-            # --- Hard check: has price crossed the current sl_price? ---
-            crossed = (current_price <= pos.sl_price) if pos.side == "BUY" else (current_price >= pos.sl_price)
-            if crossed:
-                reason = "trail-exit" if pos.trail_armed else "stop-loss"
-                self._log(f"{tag} SL hit at {profit_r:.2f}R (level {pos.sl_price:.2f}) -> closing now")
-                self.close_position_by_ticket(pos.ticket, reason=reason)
+        crossed = (current_price <= pos.sl_price) if pos.side == "BUY" else (current_price >= pos.sl_price)
+        if crossed:
+            self._log(f"[{pos.side} {pos.ticket}] Stop hit at {pos.sl_price:.2f} -> closing now")
+            self.close_position_by_ticket(pos.ticket, reason="stop-loss")
+            self.position = None
 
     # ------------------------------------------------------------------
     # Risk limits
@@ -676,8 +728,6 @@ class SARTradeEngine:
     # ------------------------------------------------------------------
 
     def tick(self) -> Dict[str, Any]:
-        # Never attempt any trading action while disconnected. Instead,
-        # retry the connection on a cooldown so we don't spam MT5.
         if not self._connected:
             now = time.time()
             if now - self._last_connect_attempt >= self._reconnect_interval_seconds:
@@ -689,62 +739,53 @@ class SARTradeEngine:
             price = self.get_price() or 0.0
 
             if self.trading_halted:
-                pass  # do nothing further, just keep reporting state
+                pass
             else:
-                if not self.positions and not self.pending_straddle_tickets:
+                if self.position is None and not self.pending_straddle_tickets:
                     now = time.time()
                     if now - self._last_straddle_attempt >= self._straddle_retry_interval_seconds:
                         self._last_straddle_attempt = now
-                        # Nothing live at all yet -> first-run straddle
                         self.place_straddle(price)
 
-                new_fills = self._detect_fills()
-                if new_fills:
-                    # Any leftover straddle leg is now stale the moment
-                    # ANY fill happens (whether one leg filled or both).
-                    if self.pending_straddle_tickets:
-                        self.cancel_straddle_pending()
-                    for ticket, side, entry_price in new_fills:
-                        self._on_fill(ticket, side, entry_price)
+                had_position_before = self.position is not None
+                self._reconcile_position()
+                if self.position is not None and not had_position_before and self.pending_straddle_tickets:
+                    # A genuine new entry just landed -> the leftover
+                    # straddle leg is now stale.
+                    self.cancel_straddle_pending()
 
-                # Order matters: protection first (may move sl_price via
-                # the trail, or close a position outright), THEN verify/
-                # place/reprice stop orders against whatever's left, so
-                # the order placed always matches the latest sl_price.
-                self._apply_protection(price)
-                self._ensure_stop_orders()
+                self._apply_trailing(price)
+                self._sync_protection()
                 self._check_daily_risk()
 
         balance = self.get_balance()
         day_pnl_usd = (balance - self.daily.starting_balance) if self.daily.starting_balance else 0.0
 
-        positions_state = []
+        position_state = None
         total_profit_usd = 0.0
-        for pos in self.positions.values():
+        if self.position is not None:
+            pos = self.position
             direction = 1 if pos.side == "BUY" else -1
             price_diff = (price - pos.entry_price) * direction if price else 0.0
-            profit_r = self._profit_r_for(pos, price) if price else 0.0
             profit_usd = price_diff * self.contract_size * self.lot_size
-            total_profit_usd += profit_usd
-            positions_state.append({
+            total_profit_usd = profit_usd
+            position_state = {
                 "ticket": pos.ticket,
                 "side": pos.side,
                 "entry_price": pos.entry_price,
                 "sl_price": pos.sl_price,
-                "risk_price": pos.risk_price,
-                "profit_r": profit_r,
+                "distance": pos.distance,
                 "profit_usd": profit_usd,
-                "trail_armed": pos.trail_armed,
                 "has_stop_order": pos.stop_order_ticket is not None,
-            })
+                "trail_armed": pos.trail_armed,
+            }
 
         if self.pending_straddle_tickets:
             pending_desc = f"{len(self.pending_straddle_tickets)} straddle order(s) live"
-        elif positions_state:
-            n_with_stop = sum(1 for p in positions_state if p["has_stop_order"])
-            pending_desc = f"{n_with_stop}/{len(positions_state)} position(s) have their stop order live"
+        elif position_state is not None:
+            pending_desc = "stop order live" if position_state["has_stop_order"] else "NO STOP ORDER - placing"
         else:
-            pending_desc = "—"
+            pending_desc = "flat"
 
         return {
             "connected": self._connected,
@@ -754,12 +795,9 @@ class SARTradeEngine:
             "account_currency": self.account_currency,
             "account_balance": balance,
             "symbol": self.symbol,
-            "positions": positions_state,
+            "positions": [position_state] if position_state is not None else [],
             "current_price": price,
             "total_profit_usd": total_profit_usd,
-            "stop_loss_r": self.stop_loss_r,
-            "trail_arm_r": self.trail_arm_r,
-            "trail_buffer_r": self.trail_buffer_r,
             "pending_order_desc": pending_desc,
             "daily_pnl_usd": day_pnl_usd,
             "daily_profit_target_usd": self.target_usd,

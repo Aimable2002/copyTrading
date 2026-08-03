@@ -32,12 +32,11 @@ DEFAULT_CONFIG = {
         "contract_size": 100,
         "slippage_points": 20, "comment": "SAR-BOT",
     },
-    "protection": {"stop_loss_r": 1.0, "trail_arm_r": 1.5, "trail_buffer_r": 0.5},
     "risk": {
         "max_daily_drawdown_usd": 200.0, "daily_profit_target_usd": 300.0,
         "stop_trading_on_drawdown_hit": True, "stop_trading_on_target_hit": True,
     },
-    "engine": {"poll_interval_seconds": 1.0, "log_file": "sar_bot.log"},
+    "engine": {"poll_interval_seconds": 0.03, "log_file": "sar_bot.log"},
     "setup_complete": False,
 }
 

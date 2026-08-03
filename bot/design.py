@@ -146,24 +146,11 @@ class TerminalUI:
         )
 
         self.console.print()
-
-        # --- Profit protection: R-multiplier model ---
-        self.console.print(f"[bold {Theme.NEUTRAL}]── Risk & Protection (R-multiplier model) ──[/bold {Theme.NEUTRAL}]")
         self.console.print(
-            "  [dim]All three values below are multiples of a position's own risk unit (R), "
-            "which is computed fresh for every trade from live spread - not a fixed pip count.[/dim]"
-        )
-        cfg["protection"]["stop_loss_r"] = FloatPrompt.ask(
-            "  Hard stop-loss, in multiples of R (e.g. 1.0 = close if price moves 1R against entry)",
-            default=cfg["protection"].get("stop_loss_r", 1.0),
-        )
-        cfg["protection"]["trail_arm_r"] = FloatPrompt.ask(
-            "  Trail arm point, in multiples of R (trail starts protecting profit once reached)",
-            default=cfg["protection"].get("trail_arm_r", 1.5),
-        )
-        cfg["protection"]["trail_buffer_r"] = FloatPrompt.ask(
-            "  Trail buffer, in multiples of R (stop trails this far behind the best profit seen)",
-            default=cfg["protection"].get("trail_buffer_r", 0.5),
+            f"  [dim]Note: the stop-loss/trailing distance is not configured separately - "
+            f"it's the same %-of-price distance above, locked in fresh for each position "
+            f"the moment it opens, then trailed at that fixed distance for the rest of its "
+            f"life.[/dim]"
         )
 
         self.console.print()
@@ -189,8 +176,8 @@ class TerminalUI:
 
         self.console.print()
         cfg["engine"]["poll_interval_seconds"] = FloatPrompt.ask(
-            "  Engine poll interval (seconds)",
-            default=cfg["engine"].get("poll_interval_seconds", 1.0),
+            "  Engine poll interval (seconds) - re-verifies everything against MT5 every cycle",
+            default=cfg["engine"].get("poll_interval_seconds", 0.03),
         )
 
         cfg["setup_complete"] = True
@@ -254,43 +241,40 @@ class TerminalUI:
         pos_table.add_column("Ticket", style=Theme.DIM, width=12, no_wrap=True)
         pos_table.add_column("Entry", justify="right", width=12, no_wrap=True)
         pos_table.add_column("SL price", justify="right", width=12, no_wrap=True)
-        pos_table.add_column("P/L (R)", justify="right", width=10, no_wrap=True)
+        pos_table.add_column("Distance", justify="right", width=10, no_wrap=True)
+        pos_table.add_column("Trail", justify="center", width=9, no_wrap=True)
         pos_table.add_column("P/L (USD)", justify="right", width=12, no_wrap=True)
-        pos_table.add_column("Trail", justify="center", width=8, no_wrap=True)
         pos_table.add_column("Stop order", justify="center", no_wrap=True)
         if not positions:
-            pos_table.add_row("—", "—", "—", "—", "—", "—", "—", "no open positions")
+            pos_table.add_row("—", "—", "—", "—", "—", "—", "—", "flat - no open position")
         for p in positions:
             side_style = self._side_style(p["side"])
-            pnl_style = self._pnl_style(p["profit_r"])
+            pnl_style = self._pnl_style(p["profit_usd"])
             has_stop = p.get("has_stop_order")
             pos_table.add_row(
                 f"[bold {side_style}]{p['side']}[/bold {side_style}]",
                 str(p["ticket"]),
                 f"{p['entry_price']:.2f}",
                 f"{p['sl_price']:.2f}",
-                f"[{pnl_style}]{p['profit_r']:+.2f}R[/{pnl_style}]",
+                f"{p['distance']:.2f}",
+                f"[{Theme.PROFIT}]ARMED[/{Theme.PROFIT}]" if p.get("trail_armed") else "[dim]waiting[/dim]",
                 f"[{pnl_style}]${p['profit_usd']:+.2f}[/{pnl_style}]",
-                f"[bold {Theme.PROFIT}]ARMED[/bold {Theme.PROFIT}]" if p.get("trail_armed") else "[dim]idle[/dim]",
                 f"[{Theme.PROFIT}]● live[/{Theme.PROFIT}]" if has_stop else f"[bold {Theme.LOSS}]● MISSING[/bold {Theme.LOSS}]",
             )
 
-        # Protection panel - per-position SL/trail state now lives in the
-        # positions table above; this panel just shows the configured
-        # R-multiplier thresholds and the overall pending-order summary.
+        # Protection panel - just current price, total P/L, and the
+        # single pending-order status (this bot allows only ONE position
+        # and ONE order, ever - see core.py's module docstring).
         prot_table = Table.grid(padding=(0, 2))
         prot_table.add_column(justify="right", style=Theme.DIM)
         prot_table.add_column(justify="left")
         prot_table.add_row("Current price", f"{state.get('current_price', 0):.2f}")
         total_pnl = state.get("total_profit_usd", 0.0)
         prot_table.add_row(
-            "Total open P/L",
+            "Open P/L",
             f"[bold {self._pnl_style(total_pnl)}]${total_pnl:+.2f}[/bold {self._pnl_style(total_pnl)}]",
         )
-        prot_table.add_row("Stop-loss at", f"{state.get('stop_loss_r', 0)}R")
-        prot_table.add_row("Trail arms at", f"{state.get('trail_arm_r', 0)}R")
-        prot_table.add_row("Trail buffer", f"{state.get('trail_buffer_r', 0)}R")
-        prot_table.add_row("Pending", state.get("pending_order_desc", "—"))
+        prot_table.add_row("Stop order", state.get("pending_order_desc", "—"))
 
         # Risk panel
         risk_table = Table.grid(padding=(0, 2))
