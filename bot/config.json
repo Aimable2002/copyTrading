@@ -1,19 +1,19 @@
 {
   "mt5": {
-    "terminal_path": "C:\\Users\\ISO\\Desktop\\automation\\instances\\master_960e83d490\\terminal64.exe",
-    "login": 0,
-    "password": "",
-    "server": "",
+    "terminal_path": "C:\\Users\\ISO\\Desktop\\automation\\instances\\follower_8aacd9b445\\terminal64.exe",
+    "login": 52966054,
+    "password": "gBDR6Gl!mRHQY5",
+    "server": "ICMarketsSC-Demo",
     "timeout_ms": 10000
   },
   "trading": {
-    "symbol": "BTCUSD",
+    "symbol": "XAUUSD",
     "lot_size": 0.1,
     "magic_number": 990011,
     "initial_stop_distance_percent": 0.05,
     "spread_safety_multiplier": 1.5,
     "pip_size": 0.01,
-    "contract_size": 1.0,
+    "contract_size": 100.0,
     "slippage_points": 20,
     "comment": "SAR-BOT"
   },

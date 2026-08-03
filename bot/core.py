@@ -369,6 +369,23 @@ class SARTradeEngine:
         spread_floor = spread * self.spread_safety_multiplier
         return max(broker_min, spread_floor)
 
+    def _live_native_sl(self, pos: "PositionState") -> Optional[float]:
+        """Reads the position's ACTUAL current SL straight from MT5 - not
+        pos.sl_price (that's our own target, which is what we're trying to
+        push, not what's already live) and not a cached value. Returns
+        None if the position isn't found or has no SL set yet (e.g. the
+        very first tick after opening, before any protection has been
+        synced at all) - in both cases there's nothing to ratchet against,
+        which is the correct behavior for a brand-new position.
+        """
+        if not MT5_AVAILABLE:
+            return None
+        live = [p for p in (mt5.positions_get(symbol=self.symbol) or [])
+                if p.ticket == pos.ticket and p.magic == self.magic]
+        if not live or not live[0].sl:
+            return None
+        return live[0].sl
+
     def _valid_stop_order_price(self, side: str, target_price: float) -> Optional[float]:
         """Clamps target_price to the nearest price the broker will
         actually accept, checked against LIVE bid/ask right now - never
@@ -530,6 +547,23 @@ class SARTradeEngine:
         if valid_price is None:
             self._log(f"[{pos.side} {pos.ticket}] Cannot sync protection - no live bid/ask available.")
             return
+
+        # --- The fix: two ratchets have to compose, not compete ---
+        # _valid_stop_order_price above only enforces "not too close to the
+        # live market" - it has no concept of "not worse than what's
+        # already live", and a normal price retracement toward the stop
+        # (well within an overall winning trade) could make that clamp
+        # return something CLOSER to the market than the stop currently
+        # sits at, which would push both the native SL and the pending
+        # order backward together. This second ratchet is what was
+        # missing: never let the broker-distance clamp override a stop
+        # that's already more favorable than what it's proposing. Only
+        # tighten from here, never loosen - same rule _apply_trailing
+        # already enforces on pos.sl_price itself, now also enforced on
+        # the value actually sent to the broker.
+        live_sl = self._live_native_sl(pos)
+        if live_sl:
+            valid_price = max(valid_price, live_sl) if pos.side == "BUY" else min(valid_price, live_sl)
 
         # --- Native SL first ---
         self._sync_native_sl(pos, valid_price)
