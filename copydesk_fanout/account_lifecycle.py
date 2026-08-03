@@ -33,10 +33,6 @@ def _set_subscriptions_active(supabase_client: Any, *, account_id: str, role: Ro
 
 
 def _force_close_all_fills(fanout: FanoutCore, account_id: str, role: Role) -> int:
-    """Closes every currently-open copy this account is part of right now.
-    Returns how many were closed. For a master, this means every follower's
-    fill of every one of the master's open trades; for a follower, every
-    fill that specific follower currently holds."""
     closed_count = 0
 
     if role == "follower":
@@ -52,9 +48,8 @@ def _force_close_all_fills(fanout: FanoutCore, account_id: str, role: Role) -> i
             )
             closed_count += 1
     else:
-        # Master: close every follower's fill of every one of this master's trades.
         pairs_for_this_master = {
-            key: followers for key, followers in fanout.pair_store._pairs.items()  # noqa: SLF001 - internal, same module family, no public bulk-by-master accessor exists yet
+            key: followers for key, followers in fanout.pair_store._pairs.items()  
             if key[0] == account_id
         }
         for (master_account_id, master_ticket), followers in pairs_for_this_master.items():
@@ -75,7 +70,7 @@ def _force_close_all_fills(fanout: FanoutCore, account_id: str, role: Role) -> i
 def pause_account(
     *, account_id: str, role: Role, force_close: bool, fanout: FanoutCore, supabase_client: Any,
 ) -> dict:
-    _get_agent(fanout, account_id, role)  # raises LifecycleError if not actually running
+    _get_agent(fanout, account_id, role)  
     _set_subscriptions_active(supabase_client, account_id=account_id, role=role, active=False)
 
     closed_count = _force_close_all_fills(fanout, account_id, role) if force_close else 0
@@ -88,7 +83,7 @@ def pause_account(
 
 
 def resume_account(*, account_id: str, role: Role, fanout: FanoutCore, supabase_client: Any) -> dict:
-    _get_agent(fanout, account_id, role)  # the agent must still be running (paused ≠ stopped) - raises if not
+    _get_agent(fanout, account_id, role) 
     _set_subscriptions_active(supabase_client, account_id=account_id, role=role, active=True)
     execute_with_retry(
         lambda: supabase_client.table("accounts").update({"status": "live"}).eq("account_id", account_id).execute()
@@ -102,9 +97,6 @@ def close_account(
 ) -> dict:
     agent = _get_agent(fanout, account_id, role)
 
-    # Close is pause(force_close=True) plus actually tearing the agent down -
-    # never leave a fill dangling on an account that's about to stop being
-    # polled entirely.
     _set_subscriptions_active(supabase_client, account_id=account_id, role=role, active=False)
     closed_count = _force_close_all_fills(fanout, account_id, role)
 

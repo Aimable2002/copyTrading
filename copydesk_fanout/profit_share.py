@@ -1,30 +1,7 @@
-"""
-Profit-share billing - "if it's profit, the split is taken; if it's a
-loss, none is taken", applied per closed trade, exactly as specified.
-
-Deliberately a POLLER, not a hook on fanout_core.py's live close event.
-_fan_out_close fires the instant a position closes, but has no realized
-P&L at that moment - P&L only exists once MT5 records the deal, which is
-the same historic-trades data trade_history.py already exposes via
-fetch_historic_trades(). So this reads through that exact same path
-(get_account_trade_history), on a schedule (see main.py), rather than
-trying to correlate P&L into the live open/close event stream.
-
-Idempotency: billed_deals is keyed on (follower_account_id, deal_ticket) -
-MT5 deal tickets are already globally unique, so this table doubles as
-both the "don't double-charge" guard AND the natural place a retry/restart
-resumes from (just re-run the poll; anything already in billed_deals is
-skipped).
-
-The rate applied is always the LOCKED-IN snapshot for the follower's
-CURRENT roster slot (master_rate.get_copy_rate_for_slot), never the
-master's live rate - matches the "later rate changes only affect new
-copiers" rule from master_rate.py.
-"""
-
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import roster, trade_history, wallet
@@ -50,20 +27,6 @@ def _already_billed(follower_account_id: str, deal_ticket: str, supabase_client:
 def process_follower_deals(
     *, follower_account_id: str, billing_period_id: str, agent: Any, supabase_client: Any, pair_store: Any,
 ) -> list[dict]:
-    """Bills every newly-closed, profitable deal for one follower against
-    their current roster slot's locked-in rate. Returns the list of
-    charges applied this run (empty if nothing new, or nothing profitable,
-    or no current slot at all - e.g. they haven't switched to any master
-    yet this period).
-
-    pair_store gates this to deals that were actually copied - without it,
-    trade_history.get_account_trade_history() returns literally every deal
-    ever made on this MT5 account, with no distinction between a genuine
-    copy of a master's signal and the follower's own unrelated manual
-    trade on the same account. Both would otherwise get billed identically
-    the moment either closes in profit - a real gap, not a hypothetical
-    one: nothing before this checked that a profitable closed deal had
-    anything to do with copying at all."""
     current_slot = roster.get_current_slot(billing_period_id, follower_account_id, supabase_client)
     if current_slot is None:
         return []
@@ -81,17 +44,11 @@ def process_follower_deals(
         pnl = float(deal.get("pnl", 0) or 0)
         entry = deal.get("entry")
 
-        # Only closing deals ("out") carry realized P&L; "in" deals are
-        # always pnl=0 by construction (see trade_history.py's contract).
         if entry != "out" or pnl <= 0:
             continue
         if _already_billed(follower_account_id, ticket, supabase_client):
             continue
         if not pair_store.was_follower_ticket_copied(follower_account_id, ticket):
-            # A real deal, profitable and closed, but never a confirmed
-            # copy of any master signal - the follower's own manual trade
-            # on this account, or a leftover from before they started
-            # copying at all. Not ours to bill.
             logger.info(
                 "Follower %s deal %s (pnl=%.2f) was never a confirmed copy - not billing it",
                 follower_account_id, ticket, pnl,
@@ -134,10 +91,7 @@ def process_follower_deals(
 
 
 def run_poll_cycle(*, fanout: Any, account_user_map: dict[str, str], supabase_client: Any) -> int:
-    """One pass over every follower with an active/grace billing period.
-    Called on a schedule from main.py, same pattern as the existing
-    stale-pending sweep. Returns total charges applied this pass."""
-    from . import billing  # local import - avoids a module-level cycle with billing.py
+    from . import billing 
 
     total = 0
     for account_id, agent in fanout.follower_agents.items():
@@ -156,29 +110,42 @@ def run_poll_cycle(*, fanout: Any, account_user_map: dict[str, str], supabase_cl
 
 
 def get_master_earnings(master_account_id: str, supabase_client: Any, limit: int = 100) -> dict:
-    """Aggregates every profit_share_master transaction ever recorded
-    against this master, across ALL their followers' wallets - these
-    transactions live on the FOLLOWER's account_id (it's their wallet
-    being debited), so this is the one place that has to query across
-    accounts by related_master_account_id instead of a single account_id,
-    unlike everything else in wallet.py."""
-    response = execute_with_retry(
+    challenge_response = execute_with_retry(
         lambda: (
             supabase_client.table("wallet_transactions")
-            .select("account_id, amount, related_deal_ticket, created_at")
+            .select("account_id, type, amount, related_deal_ticket, created_at")
+            .eq("type", "challenge_reward")
+            .eq("account_id", master_account_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+    )
+    legacy_response = execute_with_retry(
+        lambda: (
+            supabase_client.table("wallet_transactions")
+            .select("account_id, type, amount, related_deal_ticket, created_at")
             .eq("type", "profit_share_master")
             .eq("related_master_account_id", master_account_id)
             .order("created_at", desc=True)
             .execute()
         )
     )
-    rows = response.data or []
-    # amount is stored negative (a debit from the follower's wallet) -
-    # the master's earned figure is the positive magnitude of that.
-    total_earned = sum(-float(r["amount"]) for r in rows)
+    rows = list(challenge_response.data or []) + list(legacy_response.data or [])
+    rows.sort(key=lambda r: r["created_at"], reverse=True)
+
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+
+    def _earned(row: dict) -> float:
+        amount = float(row["amount"])
+        return -amount if row["type"] == "profit_share_master" else amount
+
+    total_earned = sum(_earned(r) for r in rows)
+    total_earned_30d = sum(_earned(r) for r in rows if r["created_at"] >= cutoff_iso)
+
     return {
         "master_account_id": master_account_id,
         "total_earned": total_earned,
+        "total_earned_30d": total_earned_30d,
         "transaction_count": len(rows),
         "recent": rows[:limit],
     }

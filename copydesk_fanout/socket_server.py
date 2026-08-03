@@ -1,35 +1,3 @@
-"""
-Socket.IO server - the direct backend<->frontend channel for live MT
-account data (balance/open positions), per the "frontend talks to Supabase
-for config/payments/monitoring setup, but reads live account data straight
-from the backend" decision.
-
-One-way by design: server -> frontend only. Nothing here accepts trade
-actions or config changes from a client; that boundary was decided
-explicitly (manual trade intervention happens in the user's own MT5
-terminal, config/payments go through Supabase) and this module doesn't
-reopen it.
-
-Run behind ngrok:
-    - This binds to 0.0.0.0:$PORT (see run_server()) - ngrok can only
-      tunnel a port that's actually listening on all interfaces, not just
-      localhost.
-    - Whatever ngrok assigns as the public https URL for this run needs to
-      be in ALLOWED_ORIGINS (see .env.example) so the browser's Socket.IO
-      client is allowed to connect - Socket.IO enforces CORS same as any
-      other browser-facing server. ngrok's free tier URL changes every
-      restart, so ALLOWED_ORIGINS is read fresh from the environment each
-      run rather than hardcoded.
-    - See ngrok.yml alongside this file for the tunnel definition, and
-      README_NGROK.md for the two-terminal (uvicorn + ngrok) run sequence.
-
-Auth: every client must connect with a Supabase auth JWT (the same access
-token the frontend already holds from Supabase Auth) as a query param or
-in the `auth` payload. This server verifies it against Supabase's JWT
-secret and only then joins the client to that user's account rooms - a
-client can never subscribe to another user's account data.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -41,11 +9,6 @@ import socketio
 
 logger = logging.getLogger("socket_server")
 
-# TEMPORARY: allow-all while iterating with Lovable (its preview URL
-# changes across sessions/deploys, same reason ngrok's free-tier URL does).
-# TIGHTEN before real signups: set ALLOWED_ORIGINS in .env to the real
-# frontend domain(s) once one is stable, then change this back to actually
-# read that env var instead of hardcoding "*".
 _ALLOWED_ORIGINS = "*"
 
 sio = socketio.AsyncServer(
@@ -54,29 +17,10 @@ sio = socketio.AsyncServer(
 )
 asgi_app = socketio.ASGIApp(sio)
 
-# sid -> user_id, so disconnect/logging can reference who a session belonged to
 _session_users: dict[str, str] = {}
 
 
 def verify_supabase_jwt(token: str) -> str:
-    """Returns the user_id (the JWT's `sub` claim) if the token is a valid,
-    unexpired Supabase-issued access token. Raises jwt.InvalidTokenError
-    (or a subclass) otherwise - callers must catch this and reject the
-    connection, never let a client through unauthenticated.
-
-    Supabase projects sign tokens one of two ways, and this handles both:
-      - Legacy HS256: a single shared secret (SUPABASE_JWT_SECRET, from
-        Project Settings -> API -> JWT Settings -> Legacy JWT Secret -
-        NOT the anon key, NOT the service role key).
-      - New asymmetric ES256/RS256 (Project Settings -> JWT Keys -> JWT
-        Signing Keys, the default for any project that's rotated): verified
-        against Supabase's public JWKS endpoint instead of a shared secret -
-        no secret to configure for this path, just SUPABASE_URL (already
-        required elsewhere, e.g. supabase_client.py).
-    Which one to use is read straight off the token's own header (`alg`),
-    not guessed - a project that's rotated issues ES256 tokens going
-    forward, so this checks the actual token rather than assuming.
-    """
     header = jwt.get_unverified_header(token)
     algorithm = header.get("alg", "HS256")
 
@@ -99,8 +43,6 @@ _jwks_client: "jwt.PyJWKClient | None" = None
 
 
 def _get_jwks_client() -> "jwt.PyJWKClient":
-    """Lazy + cached: one client reused for the process lifetime, so keys
-    already seen don't trigger a network fetch on every single request."""
     global _jwks_client
     if _jwks_client is None:
         supabase_url = os.environ.get("SUPABASE_URL")
@@ -118,8 +60,6 @@ def _get_jwks_client() -> "jwt.PyJWKClient":
 async def connect(sid: str, environ: dict[str, Any], auth: dict[str, Any] | None) -> bool:
     token = (auth or {}).get("token")
     if not token:
-        # Also accept it as a query param (?token=...) - some Socket.IO
-        # client setups find that easier to attach than the `auth` payload.
         query_string = environ.get("QUERY_STRING", "")
         params = dict(pair.split("=", 1) for pair in query_string.split("&") if "=" in pair)
         token = params.get("token")
@@ -135,10 +75,6 @@ async def connect(sid: str, environ: dict[str, Any], auth: dict[str, Any] | None
         return False
 
     _session_users[sid] = user_id
-    # Room per user, not per account - a user with multiple accounts (one
-    # master + several followers) gets all of their own live-state emits
-    # through this single room join, no per-account subscribe call needed
-    # from the frontend.
     await sio.enter_room(sid, f"user:{user_id}")
     logger.info("Connection %s authenticated as user %s", sid, user_id)
     return True
@@ -161,10 +97,6 @@ async def emit_account_state(user_id: str, account_id: str, state: dict[str, Any
 
 
 def run_server(port: int | None = None) -> None:
-    """Starts the ASGI app with uvicorn, bound to 0.0.0.0 so ngrok can
-    reach it. Call via `python -m copydesk_fanout.socket_server` for a
-    standalone run, or import run_server() from main.py to run it
-    alongside the fanout agents in one process."""
     import uvicorn
 
     resolved_port = port or int(os.environ.get("PORT", "8000"))
