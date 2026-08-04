@@ -38,11 +38,17 @@ _ORDER_TYPE_STR_TO_MT5 = {
     "sell_stop": ORDER_TYPE_SELL_STOP,
 }
 _MT5_PENDING_TYPE_TO_STR = {
+    ORDER_TYPE_BUY: "buy",
+    ORDER_TYPE_SELL: "sell",
     ORDER_TYPE_BUY_LIMIT: "buy_limit",
     ORDER_TYPE_SELL_LIMIT: "sell_limit",
     ORDER_TYPE_BUY_STOP: "buy_stop",
     ORDER_TYPE_SELL_STOP: "sell_stop",
 }
+
+_GENUINE_PENDING_TYPES = frozenset({
+    ORDER_TYPE_BUY_LIMIT, ORDER_TYPE_SELL_LIMIT, ORDER_TYPE_BUY_STOP, ORDER_TYPE_SELL_STOP,
+})
 
 
 # --------------------------------------------------------------------- #
@@ -92,7 +98,11 @@ def order_to_pending_order_dict(order: Any) -> dict:
 def orders_to_pending_orders(orders: Optional[list]) -> dict:
     if not orders:
         return {}
-    return {str(o.ticket): order_to_pending_order_dict(o) for o in orders}
+    return {
+        str(o.ticket): order_to_pending_order_dict(o)
+        for o in orders
+        if o.type in _GENUINE_PENDING_TYPES
+    }
 
 
 def account_info_to_dict(info: Any) -> dict:

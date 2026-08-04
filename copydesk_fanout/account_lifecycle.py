@@ -32,6 +32,39 @@ def _set_subscriptions_active(supabase_client: Any, *, account_id: str, role: Ro
     )
 
 
+def _reactivate_current_subscriptions(supabase_client: Any, *, account_id: str, role: Role) -> int:
+    slot_column = "master_account_id" if role == "master" else "follower_account_id"
+    current_slots = execute_with_retry(
+        lambda: (
+            supabase_client.table("roster_slots")
+            .select("follower_account_id,master_account_id")
+            .eq(slot_column, account_id)
+            .eq("is_current", True)
+            .execute()
+        )
+    )
+    slot_rows = current_slots.data or []
+    reactivated = 0
+    for slot in slot_rows:
+        execute_with_retry(
+            lambda slot=slot: (
+                supabase_client.table("subscriptions")
+                .update({"active": True})
+                .eq("follower_account_id", slot["follower_account_id"])
+                .eq("master_account_id", slot["master_account_id"])
+                .execute()
+            )
+        )
+        reactivated += 1
+    if not slot_rows:
+        logger.info(
+            "Resume: %s account %s has no current roster_slot - nothing to reactivate in subscriptions "
+            "(account was never subscribed/subscribed-to, or was already fully switched away).",
+            role, account_id,
+        )
+    return reactivated
+
+
 def _force_close_all_fills(fanout: FanoutCore, account_id: str, role: Role) -> int:
     closed_count = 0
 
@@ -83,12 +116,12 @@ def pause_account(
 
 
 def resume_account(*, account_id: str, role: Role, fanout: FanoutCore, supabase_client: Any) -> dict:
-    _get_agent(fanout, account_id, role) 
-    _set_subscriptions_active(supabase_client, account_id=account_id, role=role, active=True)
+    _get_agent(fanout, account_id, role)
+    reactivated = _reactivate_current_subscriptions(supabase_client, account_id=account_id, role=role)
     execute_with_retry(
         lambda: supabase_client.table("accounts").update({"status": "live"}).eq("account_id", account_id).execute()
     )
-    logger.info("Resumed %s account %s", role, account_id)
+    logger.info("Resumed %s account %s (%d subscription row(s) reactivated)", role, account_id, reactivated)
     return {"account_id": account_id, "status": "live"}
 
 

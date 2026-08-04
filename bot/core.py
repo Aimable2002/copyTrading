@@ -21,33 +21,45 @@ STRATEGY - exactly two rules, nothing else:
      immediately too. The single-slot rule is enforced by the shape of
      the data, not by cleanup logic bolted on afterward.
 
-  2. ONE PRICE, PUSHED TO TWO PLACES: NATIVE SL AND THE PENDING ORDER.
-     Every open position has a real, broker-side stop-loss attached to
-     it directly (TRADE_ACTION_SLTP - the same SL MT5 shows in its own
-     S/L column), so protection is enforced by the exchange itself, not
-     only by this process polling price. The single pending order
-     (the stop-and-reverse order) is always kept at that EXACT SAME
-     price - never a separately-computed level. There is never more
-     than one live pending order for this symbol/magic (any extra is a
-     duplicate and gets cancelled). That one shared price sits at a
-     LOCKED, FIXED distance from the best price reached since entry -
-     computed once when the position opens from the live spread, and
-     never recalculated afterward. Every tick, the candidate stop level
-     is (current price - that fixed distance); if that candidate is
-     better than the current stop level, BOTH the native SL and the
-     pending order are moved to it together, in the same step - they
-     can never show two different numbers. It never loosens. There is
-     no separate "hard stop" phase versus "trail" phase - this single
-     rule IS the initial stop (on the very first tick, current price ~=
-     entry price, so the candidate is entry -/+ distance) and IS the
-     ongoing trail (as price moves favorably, the candidate keeps
-     improving). One formula, one price, two places it's written, from
-     the moment the position opens until it closes.
+  2. TWO PRICES, ONE DISTANCE APART, BOTH TRAILING TOGETHER: NATIVE SL
+     AND THE PENDING REVERSE ORDER ARE SEPARATED BY A FULL EXTRA
+     `distance`, NOT WELDED TO THE SAME PRICE. Every open position has
+     a real, broker-side stop-loss attached to it directly
+     (TRADE_ACTION_SLTP - the same SL MT5 shows in its own S/L column),
+     so protection is enforced by the exchange itself, not only by this
+     process polling price. The single pending order (the
+     stop-and-reverse order) sits one more `distance` beyond that SL,
+     in the same direction, away from price - so price has to travel
+     the SL distance AND THEN the same distance again before a reversal
+     actually triggers. There is never more than one live pending order
+     for this symbol/magic (any extra is a duplicate and gets
+     cancelled). `distance` itself is still a LOCKED, FIXED value from
+     the best price reached since entry - computed once when the
+     position opens from the live spread, and never recalculated
+     afterward. Every tick: candidate SL = (current price - distance);
+     candidate pending order = (that SL - distance again, same
+     direction). If either candidate is better (tighter) than what's
+     currently live, it moves; if not, it stays. Both ratchet in
+     lockstep - the SL only tightens, and the pending order only
+     tightens right along with it, always held exactly one `distance`
+     further out than wherever the SL currently sits. Neither ever
+     loosens. There is no separate "hard stop" phase versus "trail"
+     phase - this rule IS the initial placement (on the very first
+     tick, current price ~= entry price, so SL = entry -/+ distance and
+     pending = entry -/+ 2x distance) and IS the ongoing trail (as price
+     moves favorably, both candidates keep improving together). One
+     formula, two prices exactly one distance apart, from the moment
+     the position opens until it closes.
 
-  Because rule 2 makes the pending order nothing but this position's
-  stop-loss, and rule 1 allows only one position, the system cannot
+  Because rule 2 keeps the pending order permanently one distance
+  behind the SL (never at the same price as before), a stop-out no
+  longer fires the reversal in the same instant - price has to
+  continue traveling past the SL level before the flip actually
+  triggers, which is what stops normal chop around the SL from
+  immediately re-opening the position in the other direction. Rule 1
+  still allows only one position at a time, so the system still cannot
   represent two live trades protected by two different orders - there
-  is only ever one slot, one order, one distance.
+  is only ever one slot, one reversal order, one distance used twice.
 
   MT5 IS THE SOURCE OF TRUTH, EVERY TICK: nothing here is inferred from
   memory of what "should" be true. Every tick, the bot re-pulls the live
@@ -465,13 +477,16 @@ class SARTradeEngine:
         self.pending_straddle_tickets.clear()
 
     # ------------------------------------------------------------------
-    # Rule 2: one price (pos.sl_price), pushed to two places every tick -
-    # the position's native broker-side SL and the single pending order.
+    # Rule 2: two prices, one `distance` apart, both trailing together -
+    # the position's native broker-side SL, and the single pending
+    # reverse order held one more `distance` beyond it every tick.
     # ------------------------------------------------------------------
 
     def _place_stop_order(self, pos: PositionState, valid_price: float) -> Optional[int]:
-        """Places THE ONE pending order for the current position, at the
-        exact same already-validated price just applied to its native SL."""
+        """Places THE ONE pending reverse order for the current position,
+        at valid_price - which the caller (_sync_protection) has already
+        computed as the SL price plus one more `distance` in the same
+        direction, not the SL price itself."""
         if not MT5_AVAILABLE:
             self._log(f"[SIMULATED] Stop order placed at {valid_price:.2f} for {pos.side} {pos.ticket}")
             return None
@@ -543,51 +558,65 @@ class SARTradeEngine:
             return
 
         pos = self.position
-        valid_price = self._valid_stop_order_price(pos.side, pos.sl_price)
-        if valid_price is None:
+        sl_valid_price = self._valid_stop_order_price(pos.side, pos.sl_price)
+        if sl_valid_price is None:
             self._log(f"[{pos.side} {pos.ticket}] Cannot sync protection - no live bid/ask available.")
             return
 
-        # --- The fix: two ratchets have to compose, not compete ---
+        # --- Ratchet #1: native SL never loosens ---
         # _valid_stop_order_price above only enforces "not too close to the
         # live market" - it has no concept of "not worse than what's
         # already live", and a normal price retracement toward the stop
         # (well within an overall winning trade) could make that clamp
         # return something CLOSER to the market than the stop currently
-        # sits at, which would push both the native SL and the pending
-        # order backward together. This second ratchet is what was
-        # missing: never let the broker-distance clamp override a stop
-        # that's already more favorable than what it's proposing. Only
-        # tighten from here, never loosen - same rule _apply_trailing
-        # already enforces on pos.sl_price itself, now also enforced on
-        # the value actually sent to the broker.
+        # sits at, which would push the native SL backward. Never let the
+        # broker-distance clamp override a stop that's already more
+        # favorable than what it's proposing. Only tighten from here,
+        # never loosen - same rule _apply_trailing already enforces on
+        # pos.sl_price itself, now also enforced on the value actually
+        # sent to the broker.
         live_sl = self._live_native_sl(pos)
         if live_sl:
-            valid_price = max(valid_price, live_sl) if pos.side == "BUY" else min(valid_price, live_sl)
+            sl_valid_price = max(sl_valid_price, live_sl) if pos.side == "BUY" else min(sl_valid_price, live_sl)
 
         # --- Native SL first ---
-        self._sync_native_sl(pos, valid_price)
+        self._sync_native_sl(pos, sl_valid_price)
 
-        # --- Pending order, same price ---
+        # --- Pending reverse order: one more `distance` beyond the SL,
+        # same direction, own tighten-only ratchet. This is what keeps
+        # it from sitting on top of the SL - price has to clear the SL
+        # AND THEN travel the same distance again before the reversal
+        # can actually fill. ---
+        direction = 1 if pos.side == "BUY" else -1
+        pending_target = round(sl_valid_price - direction * pos.distance, 2)
+
         now = time.time()
         live_orders = [o for o in (mt5.orders_get(symbol=self.symbol) or [])
                        if o.magic == self.magic and o.ticket not in straddle_set]
         order_by_ticket = {o.ticket: o for o in live_orders}
         order = order_by_ticket.get(pos.stop_order_ticket) if pos.stop_order_ticket is not None else None
 
+        # Ratchet #2: pending order never loosens either - if the live
+        # pending price is already further out (more favorable) than the
+        # fresh target, keep the live one.
         if order is not None:
-            if abs(order.price_open - valid_price) > 1e-9:
-                req = dict(action=mt5.TRADE_ACTION_MODIFY, order=pos.stop_order_ticket, price=valid_price)
+            live_pending = order.price_open
+            pending_target = max(pending_target, live_pending) if pos.side == "BUY" else min(pending_target, live_pending)
+
+        if order is not None:
+            if abs(order.price_open - pending_target) > 1e-9:
+                req = dict(action=mt5.TRADE_ACTION_MODIFY, order=pos.stop_order_ticket, price=pending_target)
                 result = self._order_send(req)
                 if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    self._log(f"[{pos.side} {pos.ticket}] Pending order moved to {valid_price:.2f}")
+                    self._log(f"[{pos.side} {pos.ticket}] Pending order moved to {pending_target:.2f} "
+                              f"(SL at {sl_valid_price:.2f}, {pos.distance:.2f} apart)")
                 else:
-                    self._log(f"[{pos.side} {pos.ticket}] Failed to move pending order to {valid_price:.2f} - will retry.")
+                    self._log(f"[{pos.side} {pos.ticket}] Failed to move pending order to {pending_target:.2f} - will retry.")
         else:
             pos.stop_order_ticket = None
             if now - pos.last_stop_order_attempt >= self._stop_order_retry_interval_seconds:
                 pos.last_stop_order_attempt = now
-                pos.stop_order_ticket = self._place_stop_order(pos, valid_price)
+                pos.stop_order_ticket = self._place_stop_order(pos, pending_target)
 
         # Anything live that isn't a straddle leg and isn't THE current
         # order is a duplicate/orphan - cancel it now. There is only ever
