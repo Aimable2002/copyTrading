@@ -1,21 +1,3 @@
-"""
-Master rate - each master sets their own total profit-share rate on their
-own signal, not a platform-fixed number. `master_rates` is insert-only,
-never updated in place: setting a new rate is always a new row with a
-fresh effective_from, so the exact rate a given follower copied under
-stays recoverable forever, and snapshotting for a specific copy is just
-"read the latest row and copy its values" (see snapshot_rate_for_copy).
-
-rate_percent is the ONE number a follower ever sees (what they set the
-master's page shows). platform_cut_percent is the platform's own carve-out
-FROM that rate, master-facing only - get_current_rate() (used by the
-master themselves and by roster.py's snapshot step) returns both;
-get_public_rate() (used by the directory/insight page) returns only
-rate_percent. Never expose platform_cut_percent through a follower-facing
-route - that split is enforced here at the function boundary specifically
-so api_server.py can't accidentally leak it by calling the wrong one.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -60,7 +42,6 @@ def set_rate(master_account_id: str, rate_percent: float, platform_cut_percent: 
 
 
 def get_current_rate(master_account_id: str, supabase_client: Any) -> dict | None:
-    """Full detail, including platform_cut_percent - master-facing only."""
     response = execute_with_retry(
         lambda: (
             supabase_client.table("master_rates")
@@ -80,7 +61,6 @@ def get_current_rate(master_account_id: str, supabase_client: Any) -> dict | Non
 
 
 def get_public_rate(master_account_id: str, supabase_client: Any) -> dict | None:
-    """Follower-facing - rate_percent only, never platform_cut_percent."""
     current = get_current_rate(master_account_id, supabase_client)
     if current is None:
         return None
@@ -90,10 +70,6 @@ def get_public_rate(master_account_id: str, supabase_client: Any) -> dict | None
 def snapshot_rate_for_copy(
     *, follower_account_id: str, master_account_id: str, roster_slot_id: str, supabase_client: Any,
 ) -> dict:
-    """Called once, at the moment a roster slot is created for a new
-    (follower, master) pair (see roster.py). Locks in whatever rate is
-    current right now, permanently, for this specific roster slot - later
-    changes to the master's rate never touch this row."""
     current = get_current_rate(master_account_id, supabase_client)
     if current is None:
         raise MasterRateError(f"Master {master_account_id} has not set a rate yet - cannot be copied")
@@ -124,8 +100,6 @@ def snapshot_rate_for_copy(
 
 
 def get_copy_rate_for_slot(roster_slot_id: str, supabase_client: Any) -> dict | None:
-    """What profit_share.py actually bills against - the locked-in
-    snapshot for a specific roster slot, never the master's current rate."""
     response = execute_with_retry(
         lambda: (
             supabase_client.table("follower_copy_rates")

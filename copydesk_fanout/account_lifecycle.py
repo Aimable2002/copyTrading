@@ -32,11 +32,40 @@ def _set_subscriptions_active(supabase_client: Any, *, account_id: str, role: Ro
     )
 
 
+def _reactivate_current_subscriptions(supabase_client: Any, *, account_id: str, role: Role) -> int:
+    slot_column = "master_account_id" if role == "master" else "follower_account_id"
+    current_slots = execute_with_retry(
+        lambda: (
+            supabase_client.table("roster_slots")
+            .select("follower_account_id,master_account_id")
+            .eq(slot_column, account_id)
+            .eq("is_current", True)
+            .execute()
+        )
+    )
+    slot_rows = current_slots.data or []
+    reactivated = 0
+    for slot in slot_rows:
+        execute_with_retry(
+            lambda slot=slot: (
+                supabase_client.table("subscriptions")
+                .update({"active": True})
+                .eq("follower_account_id", slot["follower_account_id"])
+                .eq("master_account_id", slot["master_account_id"])
+                .execute()
+            )
+        )
+        reactivated += 1
+    if not slot_rows:
+        logger.info(
+            "Resume: %s account %s has no current roster_slot - nothing to reactivate in subscriptions "
+            "(account was never subscribed/subscribed-to, or was already fully switched away).",
+            role, account_id,
+        )
+    return reactivated
+
+
 def _force_close_all_fills(fanout: FanoutCore, account_id: str, role: Role) -> int:
-    """Closes every currently-open copy this account is part of right now.
-    Returns how many were closed. For a master, this means every follower's
-    fill of every one of the master's open trades; for a follower, every
-    fill that specific follower currently holds."""
     closed_count = 0
 
     if role == "follower":
@@ -52,9 +81,8 @@ def _force_close_all_fills(fanout: FanoutCore, account_id: str, role: Role) -> i
             )
             closed_count += 1
     else:
-        # Master: close every follower's fill of every one of this master's trades.
         pairs_for_this_master = {
-            key: followers for key, followers in fanout.pair_store._pairs.items()  # noqa: SLF001 - internal, same module family, no public bulk-by-master accessor exists yet
+            key: followers for key, followers in fanout.pair_store._pairs.items()  
             if key[0] == account_id
         }
         for (master_account_id, master_ticket), followers in pairs_for_this_master.items():
@@ -75,7 +103,7 @@ def _force_close_all_fills(fanout: FanoutCore, account_id: str, role: Role) -> i
 def pause_account(
     *, account_id: str, role: Role, force_close: bool, fanout: FanoutCore, supabase_client: Any,
 ) -> dict:
-    _get_agent(fanout, account_id, role)  # raises LifecycleError if not actually running
+    _get_agent(fanout, account_id, role)  
     _set_subscriptions_active(supabase_client, account_id=account_id, role=role, active=False)
 
     closed_count = _force_close_all_fills(fanout, account_id, role) if force_close else 0
@@ -88,12 +116,12 @@ def pause_account(
 
 
 def resume_account(*, account_id: str, role: Role, fanout: FanoutCore, supabase_client: Any) -> dict:
-    _get_agent(fanout, account_id, role)  # the agent must still be running (paused ≠ stopped) - raises if not
-    _set_subscriptions_active(supabase_client, account_id=account_id, role=role, active=True)
+    _get_agent(fanout, account_id, role)
+    reactivated = _reactivate_current_subscriptions(supabase_client, account_id=account_id, role=role)
     execute_with_retry(
         lambda: supabase_client.table("accounts").update({"status": "live"}).eq("account_id", account_id).execute()
     )
-    logger.info("Resumed %s account %s", role, account_id)
+    logger.info("Resumed %s account %s (%d subscription row(s) reactivated)", role, account_id, reactivated)
     return {"account_id": account_id, "status": "live"}
 
 
@@ -102,9 +130,6 @@ def close_account(
 ) -> dict:
     agent = _get_agent(fanout, account_id, role)
 
-    # Close is pause(force_close=True) plus actually tearing the agent down -
-    # never leave a fill dangling on an account that's about to stop being
-    # polled entirely.
     _set_subscriptions_active(supabase_client, account_id=account_id, role=role, active=False)
     closed_count = _force_close_all_fills(fanout, account_id, role)
 

@@ -22,9 +22,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from . import account_lifecycle, billing, master_profiles, master_rate, profit_share, roster, trade_history, wallet
+from . import account_lifecycle, billing, challenges, master_profiles, master_rate, profit_share, roster, trade_history, wallet
 from .account_lifecycle import LifecycleError
 from .billing import BillingError
+from .challenges import ChallengeError
 from .fanout_core import FanoutCore
 from .master_profiles import MasterProfileError
 from .master_rate import MasterRateError
@@ -54,13 +55,12 @@ class ProvisionRequest(BaseModel):
 
 
 class PauseRequest(BaseModel):
-    force_close: bool  # required, not defaulted - "let the user choose each time" means no silent default
+    force_close: bool  
 
 
 class MasterProfileRequest(BaseModel):
     display_name: str
     bio: str = ""
-    is_public: bool = False
 
 
 class TopUpRequest(BaseModel):
@@ -78,6 +78,10 @@ class SwitchMasterRequest(BaseModel):
 class SetRateRequest(BaseModel):
     rate_percent: float
     platform_cut_percent: float
+
+
+class EnrollChallengeRequest(BaseModel):
+    challenge_id: str
 
 
 def _authenticate(authorization: str | None) -> str:
@@ -244,7 +248,7 @@ def create_api_app(
         try:
             return master_profiles.upsert_profile(
                 account_id=account_id, user_id=user_id, display_name=body.display_name,
-                bio=body.bio, is_public=body.is_public, supabase_client=supabase_client,
+                bio=body.bio, supabase_client=supabase_client,
             )
         except MasterProfileError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -401,5 +405,55 @@ def create_api_app(
         if role != "master":
             raise HTTPException(status_code=422, detail="Only master accounts have earnings")
         return profit_share.get_master_earnings(account_id, supabase_client)
+
+    # ----------------------------------------------------------------
+    # Challenges - browsing/enrolling/status/history. Challenge CRUD
+    # itself (creating/editing a challenge) is NOT here - that's a direct-
+    # Supabase admin surface, not a backend route, per the "admin uses
+    # backend where necessary, plain config CRUD doesn't need it" decision.
+    # ----------------------------------------------------------------
+
+    @app.get("/challenges")
+    def list_challenges_route(authorization: str | None = Header(default=None)):
+        _authenticate(authorization)  # any authenticated user - same as /masters/directory
+        return {"challenges": challenges.list_challenges(supabase_client)}
+
+    @app.post("/masters/{account_id}/challenges/enroll")
+    def enroll_challenge(account_id: str, body: EnrollChallengeRequest, authorization: str | None = Header(default=None)):
+        user_id = _authenticate(authorization)
+        role = _resolve_account_owner(account_user_map, account_id, user_id)
+        if role != "master":
+            raise HTTPException(status_code=422, detail="Only master accounts can enroll in challenges")
+        try:
+            return challenges.enroll(master_account_id=account_id, challenge_id=body.challenge_id, supabase_client=supabase_client)
+        except ChallengeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/masters/{account_id}/challenges/{challenge_id}/leave")
+    def leave_challenge(account_id: str, challenge_id: str, authorization: str | None = Header(default=None)):
+        user_id = _authenticate(authorization)
+        role = _resolve_account_owner(account_user_map, account_id, user_id)
+        if role != "master":
+            raise HTTPException(status_code=422, detail="Only master accounts can leave challenges")
+        try:
+            return challenges.leave(master_account_id=account_id, challenge_id=challenge_id, supabase_client=supabase_client)
+        except ChallengeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/masters/{account_id}/challenges/status")
+    def get_challenge_status(account_id: str, authorization: str | None = Header(default=None)):
+        user_id = _authenticate(authorization)
+        role = _resolve_account_owner(account_user_map, account_id, user_id)
+        if role != "master":
+            raise HTTPException(status_code=422, detail="Only master accounts have challenge status")
+        return challenges.get_status(account_id, supabase_client)
+
+    @app.get("/masters/{account_id}/challenges/history")
+    def get_challenge_history(account_id: str, authorization: str | None = Header(default=None)):
+        user_id = _authenticate(authorization)
+        role = _resolve_account_owner(account_user_map, account_id, user_id)
+        if role != "master":
+            raise HTTPException(status_code=422, detail="Only master accounts have challenge history")
+        return challenges.get_history(account_id, supabase_client)
 
     return app
