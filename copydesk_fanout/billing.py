@@ -1,30 +1,3 @@
-"""
-Subscription billing - the infra + slot fee, duration-based packages.
-Deliberately separate from `subscriptions` (the existing table, which is
-about the copy-relationship itself: multiplier, sizing_mode, active) -
-this is about paying to run the account at all, not about how it copies.
-
-Package price scales DOWN with duration (the discount is the point of
-picking a longer commitment) - PACKAGES below is the source of truth for
-that pricing, same pattern as sizing.py being the source of truth for
-sizing modes elsewhere in this codebase.
-
-Wallet creation lives here, not in provisioning.py: select_package() is
-the first moment an account's wallet can come into existence, via
-wallet.ensure_wallet(). An account can be live and trading with zero
-wallet for as long as its owner hasn't bought a package yet.
-
-Grace handling reuses account_lifecycle's EXISTING pause/close machinery
-rather than inventing a second one - the moment a charge fails
-(insufficient wallet funds), this module calls account_lifecycle.pause_
-account(force_close=False) immediately (stops new copies, same mechanism
-already used for a manual pause) and records grace_started_at. A
-scheduled sweep (see main.py) later calls check_grace_expirations(), which
-calls account_lifecycle.close_account() for anything past 5 days
-unresolved. Nothing here talks to FanoutCore/Supabase account status
-directly except through those two existing functions.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -132,8 +105,6 @@ def _enter_grace(account_id: str, role: str, fanout: Any, supabase_client: Any) 
     try:
         pause_account(account_id=account_id, role=role, force_close=False, fanout=fanout, supabase_client=supabase_client)
     except LifecycleError:
-        # Account may not have a running agent (e.g. already paused) -
-        # grace status on billing_periods is still recorded regardless.
         logger.warning("Could not pause %s on entering billing grace (already paused/closed?)", account_id)
 
 
@@ -156,8 +127,6 @@ def check_grace_expirations(fanout: Any, supabase_client: Any, agents: list) -> 
         execute_with_retry(
             lambda row=row: supabase_client.table("billing_periods").update({"status": "closed"}).eq("id", row["id"]).execute()
         )
-        # Role isn't stored on billing_periods - look it up once via accounts,
-        # same source api_server.py's account_user_map is built from.
         acct = execute_with_retry(
             lambda account_id=account_id: supabase_client.table("accounts").select("role").eq("account_id", account_id).execute()
         ).data

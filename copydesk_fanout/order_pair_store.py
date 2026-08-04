@@ -13,9 +13,6 @@ logger = logging.getLogger("order_pair_store")
 
 @dataclass
 class PendingCopy:
-    """A copy that's been dispatched to a follower but not yet confirmed filled
-    (DWX Connect's file bridge is async - we don't get the follower's ticket
-    back synchronously when placing an order)."""
 
     master_account_id: str
     master_ticket: str
@@ -25,52 +22,38 @@ class PendingCopy:
 
 
 @dataclass
+class PendingOrderCopy:
+
+    master_account_id: str
+    master_ticket: str
+    follower_account_id: str
+    follower_ticket: str
+    dispatched_lots: float
+
+
+@dataclass
 class FollowerFill:
-    """A confirmed follower fill - everything needed later to reapply
-    distance-based SL/TP against this follower's REAL entry price, and to
-    compute proportional partial closes against what we actually told this
-    follower to open (not the master's lot size, which differs)."""
 
     ticket: str
     open_price: float
     order_type: str
     dispatched_lots: float
-    current_lots: float  # updated on each partial close we execute
+    current_lots: float  
 
 
 class OrderPairStore:
-    """
-    In-memory dict is still the hot-path read/write target - zero I/O on
-    every copy decision, unchanged from the original design. What changed:
-    Supabase (order_pairs / pending_copies tables, see supabase/schema.sql)
-    is now the source of truth behind that cache. Every mutation here also
-    writes through to Supabase; on startup, rebuild_from_supabase()
-    repopulates the in-memory dicts from those tables instead of starting
-    empty. This closes the original gap noted in this class's earlier
-    docstring: "state is lost on restart."
-
-    A Supabase client is optional at construction time on purpose - existing
-    callers (e.g. local/offline testing per the original isolated-testing
-    README) can still build this with no client and get the exact old
-    in-memory-only behavior; write-throughs are just skipped in that case.
-    """
 
     def __init__(self, supabase_client: Any | None = None) -> None:
         self._lock = threading.Lock()
         self._supabase = supabase_client
-        # (master_account_id, master_ticket) -> {follower_account_id: FollowerFill}
         self._pairs: dict[tuple[str, str], dict[str, FollowerFill]] = {}
-        # follower_account_id -> [PendingCopy, ...] awaiting fill confirmation
         self._pending: dict[str, list[PendingCopy]] = {}
+        self._pending_orders: dict[tuple[str, str], dict[str, PendingOrderCopy]] = {}
 
     # ------------------------------------------------------------------ #
     # Startup recovery
     # ------------------------------------------------------------------ #
     def rebuild_from_supabase(self) -> None:
-        """Call once at backend startup, before agents start. Repopulates
-        in-memory state from Supabase so a restart with open copied trades
-        doesn't lose the master<->follower ticket pairings a later close/
-        modify/partial-close on the master needs to propagate correctly."""
         if self._supabase is None:
             logger.warning("rebuild_from_supabase called with no Supabase client configured - skipping")
             return
@@ -81,10 +64,14 @@ class OrderPairStore:
         pending_response = execute_with_retry(
             lambda: self._supabase.table("pending_copies").select("*").execute()
         )
+        pending_orders_response = execute_with_retry(
+            lambda: self._supabase.table("pending_order_pairs").select("*").execute()
+        )
 
         with self._lock:
             self._pairs.clear()
             self._pending.clear()
+            self._pending_orders.clear()
 
             for row in pairs_response.data or []:
                 key = (row["master_account_id"], row["master_ticket"])
@@ -106,9 +93,19 @@ class OrderPairStore:
                     )
                 )
 
+            for row in pending_orders_response.data or []:
+                key = (row["master_account_id"], row["master_ticket"])
+                self._pending_orders.setdefault(key, {})[row["follower_account_id"]] = PendingOrderCopy(
+                    master_account_id=row["master_account_id"],
+                    master_ticket=row["master_ticket"],
+                    follower_account_id=row["follower_account_id"],
+                    follower_ticket=row["follower_ticket"],
+                    dispatched_lots=row["dispatched_lots"],
+                )
+
         logger.info(
-            "Rebuilt OrderPairStore from Supabase: %d open pair(s), %d pending copy(ies)",
-            len(pairs_response.data or []), len(pending_response.data or []),
+            "Rebuilt OrderPairStore from Supabase: %d open pair(s), %d pending copy(ies), %d resting pending order copy(ies)",
+            len(pairs_response.data or []), len(pending_response.data or []), len(pending_orders_response.data or []),
         )
 
     # ------------------------------------------------------------------ #
@@ -187,11 +184,72 @@ class OrderPairStore:
             },
         )
 
+    def remove_pending(self, master_account_id: str, master_ticket: str, follower_account_id: str) -> None:
+        with self._lock:
+            pending_list = self._pending.get(follower_account_id, [])
+            self._pending[follower_account_id] = [
+                p for p in pending_list if p.master_ticket != master_ticket
+            ]
+        self._delete_pending_row(master_account_id, master_ticket, follower_account_id)
+
+    def add_pending_order(
+        self, master_account_id: str, master_ticket: str, follower_account_id: str,
+        follower_ticket: str, dispatched_lots: float,
+    ) -> None:
+        key = (master_account_id, master_ticket)
+        with self._lock:
+            self._pending_orders.setdefault(key, {})[follower_account_id] = PendingOrderCopy(
+                master_account_id=master_account_id, master_ticket=master_ticket,
+                follower_account_id=follower_account_id, follower_ticket=follower_ticket,
+                dispatched_lots=dispatched_lots,
+            )
+        self._write_through(
+            "pending_order_pairs",
+            {
+                "master_account_id": master_account_id,
+                "master_ticket": master_ticket,
+                "follower_account_id": follower_account_id,
+                "follower_ticket": follower_ticket,
+                "dispatched_lots": dispatched_lots,
+            },
+            on_conflict="master_account_id,master_ticket,follower_account_id",
+        )
+
+    def get_pending_order_followers(self, master_account_id: str, master_ticket: str) -> dict[str, PendingOrderCopy]:
+        with self._lock:
+            return dict(self._pending_orders.get((master_account_id, master_ticket), {}))
+
+    def remove_pending_order(self, master_account_id: str, master_ticket: str, follower_account_id: str | None = None) -> None:
+        key = (master_account_id, master_ticket)
+        with self._lock:
+            if follower_account_id is None:
+                followers = list(self._pending_orders.pop(key, {}).keys())
+            else:
+                self._pending_orders.get(key, {}).pop(follower_account_id, None)
+                followers = [follower_account_id]
+        if self._supabase is None:
+            return
+        for fid in followers:
+            try:
+                execute_with_retry(
+                    lambda fid=fid: (
+                        self._supabase.table("pending_order_pairs")
+                        .delete()
+                        .eq("master_account_id", master_account_id)
+                        .eq("master_ticket", master_ticket)
+                        .eq("follower_account_id", fid)
+                        .execute()
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Supabase pending_order_pairs delete failed for %s/%s/%s",
+                    master_account_id, master_ticket, fid,
+                )
+
     def confirm_fill(
         self, follower_account_id: str, master_ticket: str, follower_ticket: str, open_price: float, order_type: str
-    ) -> bool:
-        """Call this once a follower's new order is observed with a comment
-        tag matching master_ticket. Moves it from pending to confirmed."""
+    ) -> str | None:
         master_account_id: str | None = None
         dispatched_lots: float | None = None
 
@@ -213,10 +271,8 @@ class OrderPairStore:
                     break
 
         if master_account_id is None:
-            return False
+            return None
 
-        # Write-through happens outside the lock - these are network calls
-        # and must not hold up the hot in-memory path for other threads.
         self._delete_pending_row(master_account_id, master_ticket, follower_account_id)
         self._write_through(
             "order_pairs",
@@ -233,7 +289,7 @@ class OrderPairStore:
             },
             on_conflict="master_account_id,master_ticket,follower_account_id",
         )
-        return True
+        return master_account_id
 
     def get_follower_fills(self, master_account_id: str, master_ticket: str) -> dict[str, FollowerFill]:
         with self._lock:
@@ -258,28 +314,24 @@ class OrderPairStore:
     def remove_master_trade(self, master_account_id: str, master_ticket: str) -> None:
         with self._lock:
             followers = self._pairs.pop((master_account_id, master_ticket), {})
-        # Mark closed rather than delete - keeps a real audit trail of
-        # completed copies instead of erasing history on every close.
         for follower_account_id in followers:
             self._mark_pair_closed(master_account_id, master_ticket, follower_account_id)
 
     def expire_stale_pending(self, max_age_seconds: float = 60.0) -> list[PendingCopy]:
-        """Call periodically (see main.py's sweep task). A pending copy
-        still unconfirmed after max_age_seconds almost always means the
-        follower's EA rejected the order - MaximumOrders/MaximumLotSize
-        reached, invalid symbol, broker reject, etc (see the SendError
-        calls in mql/DWX_Server_MT5.mq5's OpenOrder()). Those errors don't
-        carry the comment/master_ticket needed to correlate directly, so
-        this timeout is the backstop that actually clears them rather than
-        leaving a pending_copies row (and in-memory entry) orphaned
-        forever. Returns what it expired, for logging/alerting by the caller."""
         expired: list[PendingCopy] = []
         now = time.monotonic()
         with self._lock:
             for follower_account_id, pending_list in list(self._pending.items()):
                 still_pending = []
                 for pending in pending_list:
-                    if now - pending.created_at > max_age_seconds:
+                    is_resting_pending_order = any(
+                        follower_account_id in followers
+                        for (m_id, m_ticket), followers in self._pending_orders.items()
+                        if m_id == pending.master_account_id and m_ticket == pending.master_ticket
+                    )
+                    if is_resting_pending_order:
+                        still_pending.append(pending)
+                    elif now - pending.created_at > max_age_seconds:
                         expired.append(pending)
                     else:
                         still_pending.append(pending)
@@ -297,31 +349,7 @@ class OrderPairStore:
         return expired
 
     def was_follower_ticket_copied(self, follower_account_id: str, follower_ticket: str) -> bool:
-        """Whether this follower ticket is a confirmed copy of some master
-        signal, ever - checked against the PERSISTED order_pairs table
-        (any status, open or closed), not the in-memory _pairs cache.
-
-        Deliberately different from find_master_ticket_by_follower_ticket()
-        above: that one only searches _pairs, which remove_master_trade()
-        pops the moment a master position closes - so it correctly answers
-        "is there still a live pair to route a modify/close to" for
-        fanout_core.py's use case, but would WRONGLY say "not a copy" for
-        a genuinely-copied trade that has since closed, since by
-        definition it's no longer in that cache. profit_share.py needs the
-        opposite question answered: "was this EVER a real copy, regardless
-        of whether it's still open" - which is exactly what the persisted
-        table (a row per pair, status updated in place, never deleted -
-        see _mark_pair_closed) can answer and the in-memory cache can't.
-
-        Used to gate profit-share billing so a follower's own unrelated
-        manual trades on the same account never get billed as if they were
-        copied - see profit_share.process_follower_deals().
-        """
         if self._supabase is None:
-            # No persistence configured (e.g. local/offline testing) -
-            # can't verify either way. Fail closed (treat as NOT a copy)
-            # rather than silently billing everything, since unconditional
-            # billing is the exact bug this method exists to prevent.
             return False
         response = execute_with_retry(
             lambda: (
@@ -336,8 +364,6 @@ class OrderPairStore:
         return bool(response.data)
 
     def find_master_ticket_by_follower_ticket(self, follower_account_id: str, follower_ticket: str) -> str | None:
-        """Used when a follower's copied position gets closed - need to know
-        which master trade it belonged to, e.g. for logging/cleanup."""
         with self._lock:
             for (master_account_id, master_ticket), followers in self._pairs.items():
                 fill = followers.get(follower_account_id)
@@ -346,19 +372,10 @@ class OrderPairStore:
             return None
 
     def get_open_master_tickets(self, master_account_id: str) -> set[str]:
-        """All master_ticket values we currently believe are open for this
-        master account, per the in-memory _pairs cache. Call this only
-        after rebuild_from_supabase() has run - that's what makes this
-        reflect Supabase's view rather than an empty just-booted cache.
-        Used by TerminalAgent.reconcile() at startup to detect trades that
-        opened or closed on the master while this process was down."""
         with self._lock:
             return {mt for (macc, mt) in self._pairs.keys() if macc == master_account_id}
 
     def get_expected_follower_tickets(self, follower_account_id: str) -> set[str]:
-        """All follower_ticket values we currently believe are open on this
-        follower account. Same startup-reconciliation use case as
-        get_open_master_tickets, from the follower side."""
         with self._lock:
             return {
                 fill.ticket
@@ -368,9 +385,6 @@ class OrderPairStore:
             }
 
     def get_all_fills_for_follower(self, follower_account_id: str) -> dict[tuple[str, str], FollowerFill]:
-        """Every currently-open pair this follower is part of, keyed by
-        (master_account_id, master_ticket) - used by account_lifecycle.py's
-        force-close-on-pause path."""
         with self._lock:
             return {
                 key: followers[follower_account_id]

@@ -10,26 +10,22 @@ from .base_agent import BaseAgent
 
 logger = logging.getLogger("terminal_agent")
 
-TradeEventType = Literal["opened", "closed", "modified", "partial_closed"]
+TradeEventType = Literal[
+    "opened", "closed", "modified", "partial_closed",
+    "pending_placed", "pending_cancelled", "pending_triggered",
+]
 
-# Signature: on_trade_event(account_id, event_type, ticket, order_dict)
 TradeEventCallback = Callable[[str, TradeEventType, str, dict], None]
 
 
 @dataclass
 class ReconciliationResult:
-    """Output of TerminalAgent.reconcile() - what the terminal's real state
-    looked like versus what we expected, at the moment reconciliation ran."""
 
     matched: set[str] = field(default_factory=set)
     closed_while_offline: set[str] = field(default_factory=set)
     new_while_offline: set[str] = field(default_factory=set)
     live_orders: dict[str, dict] = field(default_factory=dict)
 
-# Both loops now read self.terminal.open_orders, an in-memory dict backed
-# by the Mt5Terminal sidecar (positions_get() under the hood) - no disk
-# I/O, so this can run tighter than the old file-poll interval without
-# adding real load.
 _ORDER_EVENT_POLL_SECONDS = 0.03
 _MODIFICATION_POLL_SECONDS = 0.03
 
@@ -42,6 +38,7 @@ class TerminalAgent(BaseAgent):
                           max_orders=max_orders, max_lot_size=max_lot_size, verbose=verbose)
         self._on_trade_event = on_trade_event
         self._last_orders: dict[str, dict] = {}
+        self._last_pending_orders: dict[str, dict] = {}
         self._last_full_snapshot: dict[str, dict] = {}
         self._order_event_thread: threading.Thread | None = None
         self._modification_thread: threading.Thread | None = None
@@ -57,6 +54,7 @@ class TerminalAgent(BaseAgent):
 
         self._last_orders = dict(live)
         self._last_full_snapshot = dict(live)
+        self._last_pending_orders = dict(self.terminal.pending_orders)
 
         if closed_while_offline:
             logger.warning(
@@ -95,24 +93,33 @@ class TerminalAgent(BaseAgent):
         super().stop()
 
     def _order_event_poll_loop(self) -> None:
-        """Replaces what used to be dwx_client calling on_order_event()
-        for us whenever DWX_Orders.txt changed. Nothing pushes to us now
-        - self.terminal.open_orders is just a live property - so this
-        loop is what notices a ticket appeared or disappeared and raises
-        the same 'opened'/'closed' events fanout_core.py already expects.
-        """
         while self._poll_threads_running:
             time.sleep(_ORDER_EVENT_POLL_SECONDS)
             try:
                 self.on_order_event()
-            except Exception:  # noqa: BLE001 - a poll-loop crash should not kill the whole agent
+            except Exception:  
                 pass
 
     def on_order_event(self) -> None:
         current = dict(self.terminal.open_orders)
+        current_pending = dict(self.terminal.pending_orders)
+
+        vanished_pending = set(self._last_pending_orders) - set(current_pending)
+        triggered = vanished_pending & set(current)  # same ticket, now a position
+        cancelled = vanished_pending - triggered
+
+        for ticket in triggered:
+            self._on_trade_event(self.account_id, "pending_triggered", ticket, current[ticket])
+
+        for ticket in cancelled:
+            self._on_trade_event(self.account_id, "pending_cancelled", ticket, self._last_pending_orders[ticket])
+
+        for ticket, order in current_pending.items():
+            if ticket not in self._last_pending_orders:
+                self._on_trade_event(self.account_id, "pending_placed", ticket, order)
 
         for ticket, order in current.items():
-            if ticket not in self._last_orders:
+            if ticket not in self._last_orders and ticket not in triggered:
                 self._on_trade_event(self.account_id, "opened", ticket, order)
 
         for ticket, order in self._last_orders.items():
@@ -120,13 +127,14 @@ class TerminalAgent(BaseAgent):
                 self._on_trade_event(self.account_id, "closed", ticket, order)
 
         self._last_orders = current
+        self._last_pending_orders = current_pending
 
     def _modification_poll_loop(self) -> None:
         while self._poll_threads_running:
             time.sleep(_MODIFICATION_POLL_SECONDS)
             try:
                 self._check_for_modifications()
-            except Exception:  # noqa: BLE001 - a poll-loop crash should not kill the whole agent
+            except Exception: 
                 pass
 
     def _check_for_modifications(self) -> None:
@@ -135,7 +143,7 @@ class TerminalAgent(BaseAgent):
         for ticket, order in current.items():
             previous = self._last_full_snapshot.get(ticket)
             if previous is None:
-                continue  # newly opened - on_order_event already handles this, nothing to compare against yet
+                continue 
 
             old_lots = previous.get("lots", 0)
             new_lots = order.get("lots", 0)

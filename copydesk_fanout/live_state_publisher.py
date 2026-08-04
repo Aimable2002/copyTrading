@@ -1,29 +1,3 @@
-"""
-Throttled live-state publisher - reads each registered agent's current
-balance/open positions and pushes them out on two paths:
-
-  1. Socket.IO emit to that account's user room - instant, what the
-     frontend actually renders from while connected.
-  2. A write to the `live_account_state` Supabase table - not for the
-     frontend to poll, but so a fresh page load / reconnect has an
-     immediate last-known-state to paint before the next socket emit
-     arrives, instead of a blank screen.
-
-Runs as an asyncio background task inside the same event loop as the
-Socket.IO server (started via sio.start_background_task in main.py), not a
-separate thread - this keeps emit_account_state() calls on the loop that
-actually owns the websocket connections, and lets the Supabase write use
-run_in_executor so a slow network call never blocks the loop that's also
-serving other agents' emits.
-
-Reads agent.balance / agent.terminal.open_orders directly (see base_agent.py) -
-these are the same in-memory attributes TerminalAgent/FollowerAgent already
-maintain from DWX Connect's file polling, no new I/O against MT5 added
-here. account_id -> user_id mapping comes from the `accounts` table, fetched
-once at startup (see main.py) - accounts don't change ownership at runtime,
-so no need to re-fetch this per tick.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -39,7 +13,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("live_state_publisher")
 
-DEFAULT_INTERVAL_SECONDS = 0.01  # throttled on purpose - this is a display refresh rate, not the ~25ms trading poll rate
+DEFAULT_INTERVAL_SECONDS = 0.01 
 
 
 def _serialize_open_positions(agent: BaseAgent) -> list[dict[str, Any]]:
@@ -56,12 +30,10 @@ def _serialize_open_positions(agent: BaseAgent) -> list[dict[str, Any]]:
                 "TP": order.get("TP"),
             }
         )
-    # print(" positions in serelialization :", positions)
     return positions
 
 
 def _build_state(agent: BaseAgent) -> dict[str, Any]:
-    # print(" checking what the agent termonal account info has :", agent.terminal.account_info)
     return {
         "balance": agent.terminal.account_info.get("balance"),
         "equity": agent.terminal.account_info.get("equity"),
@@ -71,7 +43,6 @@ def _build_state(agent: BaseAgent) -> dict[str, Any]:
 
 def _write_live_state_row(supabase_client: Any, account_id: str, state: dict[str, Any]) -> None:
     try:
-        # print(" writing state data to db ===============")
         execute_with_retry(
             lambda: supabase_client.table("live_account_state").upsert(
                 {
@@ -93,31 +64,21 @@ async def run_live_state_publisher(
     supabase_client: Any,
     interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
 ) -> None:
-    """Runs forever. Reads fanout.master_agents / fanout.follower_agents
-    fresh every tick (not a snapshot taken once at startup) so an agent
-    registered after this loop starts - e.g. by a future dynamic
-    orchestrator - gets picked up on the very next tick with no restart."""
     loop = asyncio.get_event_loop()
 
     while True:
-        # print(" is this running /////////////////////////////////")
         agents: dict[str, BaseAgent] = {**fanout.master_agents, **fanout.follower_agents}
 
         for account_id, agent in agents.items():
             try:
-                # print(" DEBUG agent logs :", agent)
                 if not agent.is_connected:
-                    # print(" the agent.is_connected blocked the loop to continue investigate this gap")
                     continue  
 
                 user_id = account_user_map.get(account_id)
-                # print(" printing the user :", user_id)
                 if not user_id:
                     logger.warning("No user_id mapped for account %s - skipping publish", account_id)
                     continue
-                # print(" The print debug before the state is called ......")
                 state = _build_state(agent)
-                # print(" state from __build state :", state)
 
                 try:
                     await emit_account_state(user_id, account_id, state)
