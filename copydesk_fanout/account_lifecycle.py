@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Literal
 
+from . import instance_pool
 from .fanout_core import FanoutCore
 from .follower_agent import FollowerAgent
 from .supabase_client import execute_with_retry
@@ -141,16 +142,14 @@ def close_account(
     if agent in agents:
         agents.remove(agent)
 
-    terminal_process = getattr(agent, "terminal_process", None)
-    if terminal_process is not None and terminal_process.poll() is None:
-        terminal_process.terminate()
-        logger.info("Terminated terminal process (pid %s) for %s", terminal_process.pid, account_id)
-    else:
-        logger.warning(
-            "No live process handle for %s - if the backend restarted since this account was "
-            "provisioned, its terminal process is now an orphan needing manual cleanup.",
-            account_id,
-        )
+    # The terminal process itself is a pool instance and is never stopped - it keeps
+    # running so it can be claimed by the next account. See instance_pool.py's module
+    # docstring for why there's no "log out to blank" step here beyond deleting the
+    # on-disk credentials and freeing the row: agent.stop() above already tore down the
+    # only thing this backend was holding for this account (the worker process talking
+    # to it), so there's nothing here that can go orphaned by a backend restart the way
+    # a directly-owned terminal_process handle used to.
+    instance_pool.release_instance(account_id=account_id, supabase_client=supabase_client)
 
     execute_with_retry(
         lambda: supabase_client.table("accounts").update({"status": "closed"}).eq("account_id", account_id).execute()

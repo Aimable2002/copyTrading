@@ -42,9 +42,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from postgrest.exceptions import APIError
+
 from .supabase_client import execute_with_retry
 
 logger = logging.getLogger("challenges")
+
+_ENROLLMENT_UNIQUE_VIOLATION = "23505"
 
 
 class ChallengeError(Exception):
@@ -130,11 +134,36 @@ def enroll(*, master_account_id: str, challenge_id: str, supabase_client: Any) -
     if not challenge["is_fixed"] and not has_passed_challenge_one(master_account_id, supabase_client):
         raise ChallengeError("Challenge 1 must be passed before enrolling in any other challenge")
 
-    insert_response = execute_with_retry(
-        lambda: supabase_client.table("master_challenge_enrollments").insert(
-            {"master_account_id": master_account_id, "challenge_id": challenge_id, "status": "enrolled"}
-        ).execute()
-    )
+    try:
+        insert_response = execute_with_retry(
+            lambda: supabase_client.table("master_challenge_enrollments").insert(
+                {"master_account_id": master_account_id, "challenge_id": challenge_id, "status": "enrolled"}
+            ).execute()
+        )
+    except APIError as exc:
+        if getattr(exc, "code", None) != _ENROLLMENT_UNIQUE_VIOLATION:
+            raise
+
+        # The earlier get_current_enrollment() check is only a pre-check, not a lock -
+        # a concurrent request (double-click, client retry, two near-simultaneous
+        # calls) can pass it before either insert commits. idx_enrollments_one_active_
+        # per_master is the real guard; recover from the race instead of letting a
+        # 500 through. See roster.py's switch_master() for the same pattern.
+        logger.warning(
+            "master_challenge_enrollments insert raced for master %s / challenge %s - "
+            "another request already created an active enrollment, recovering.",
+            master_account_id, challenge_id,
+        )
+        winner = get_current_enrollment(master_account_id, supabase_client)
+        if winner is None:
+            raise ChallengeError(
+                "Enrollment conflicted with a concurrent request and the resulting "
+                "enrollment could not be found - please retry"
+            ) from exc
+        if winner["challenge_id"] != challenge_id:
+            raise ChallengeError("Already enrolled in a challenge - leave it before enrolling in another") from exc
+        return winner
+
     logger.info("Master %s enrolled in challenge %s (%s)", master_account_id, challenge_id, challenge["name"])
     return insert_response.data[0]
 

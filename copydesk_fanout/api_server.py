@@ -163,6 +163,7 @@ def create_api_app(
                 password=body.password,
                 server=body.server,
                 fanout=fanout,
+                supabase_client=supabase_client,
                 master_account_id=body.master_account_id,
                 multiplier=body.multiplier,
                 sizing_mode=body.sizing_mode,
