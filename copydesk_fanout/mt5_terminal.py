@@ -302,12 +302,27 @@ def _worker_main(
     result_q: "mp.Queue",
     poll_seconds: float = 0.05,
 ) -> None:
-    import MetaTrader5 as mt5  
-    ok = mt5.initialize(path=terminal_path, login=int(login), password=password, server=server, portable=True)
-    state["connected"] = bool(ok)
-    if not ok:
-        print(" Failed in not ok ...............", mt5.last_error())
-        state["last_error"] = str(mt5.last_error())
+    import MetaTrader5 as mt5
+
+    def _connect() -> bool:
+        # Two calls, not one: initialize() just attaches to the terminal
+        # process - it does not reliably force the same full
+        # disconnect -> reauthorize -> access-point-rescan cycle that
+        # the manual "Login" (Navigator / File > Open an Account) does,
+        # which is the thing that was actually working by hand. login()
+        # is the explicit reauthenticate call and is what reproduces
+        # that same cycle programmatically.
+        if not mt5.initialize(path=terminal_path, portable=True):
+            state["last_error"] = str(mt5.last_error())
+            return False
+        ok = mt5.login(login=int(login), password=password, server=server, timeout=60000)
+        if not ok:
+            state["last_error"] = str(mt5.last_error())
+        return bool(ok)
+
+    state["connected"] = _connect()
+    if not state["connected"]:
+        print(" Failed in not ok ...............", state["last_error"])
 
     while True:
         try:
@@ -316,12 +331,11 @@ def _worker_main(
                 result = _handle_command(mt5, cmd_type, payload)
                 result_q.put((cmd_id, result))
         except Exception:
-            pass  
+            pass
 
         if mt5.terminal_info() is None:
             state["connected"] = False
-            ok = mt5.initialize(path=terminal_path, login=login, password=password, server=server, portable=True)
-            state["connected"] = bool(ok)
+            state["connected"] = _connect()
             time.sleep(1)
             continue
 
@@ -331,7 +345,6 @@ def _worker_main(
         state["account_info"] = account_info_to_dict(mt5.account_info())
 
         time.sleep(poll_seconds)
-
 
 def _handle_command(mt5_module, cmd_type: str, payload: dict) -> dict:
     if cmd_type == "open_order":

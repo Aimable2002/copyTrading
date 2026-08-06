@@ -10,7 +10,7 @@ ENTRY_MAP = {
 }
 
 
-def get_account_trade_history(agent: BaseAgent, lookback_days: int = 30) -> list[dict[str, Any]]:
+def get_account_trade_history(agent: BaseAgent, lookback_days: int = 300) -> list[dict[str, Any]]:
     raw = agent.fetch_historic_trades(lookback_days=lookback_days)
     trades = []
     for ticket, deal in raw.items():

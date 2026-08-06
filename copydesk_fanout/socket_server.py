@@ -31,7 +31,7 @@ def verify_supabase_jwt(token: str) -> str:
                 "SUPABASE_JWT_SECRET is not set - cannot verify this HS256 token. "
                 "Copy .env.example and fill it in before running the socket server."
             )
-        payload = jwt.decode(token, secret, algorithms=["HS256"], audience="authenticated")
+        payload = jwt.decode(token, secret, algorithms=["HS256"], audience="authenticated", leeway=1200)
     else:
         signing_key = _get_jwks_client().get_signing_key_from_jwt(token)
         payload = jwt.decode(token, signing_key.key, algorithms=[algorithm], audience="authenticated")
