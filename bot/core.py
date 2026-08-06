@@ -83,8 +83,20 @@ try:
 except ImportError:
     MT5_AVAILABLE = False
 
+from smc_structure import Bar, latest_signal
+
 
 DEFAULT_CONFIG_PATH = "config.json"
+
+
+def _resolve_timeframe(name: str) -> Optional[int]:
+    """Looks up the mt5.TIMEFRAME_* constant by name at runtime instead of
+    hardcoding raw integer values, so this can never silently point at the
+    wrong timeframe."""
+    if not MT5_AVAILABLE:
+        return None
+    attr = f"TIMEFRAME_{name.upper()}"
+    return getattr(mt5, attr, None)
 
 
 # ----------------------------------------------------------------------
@@ -157,13 +169,26 @@ class SARTradeEngine:
 
         self.poll_interval: float = config["engine"]["poll_interval_seconds"]
 
+        strategy_cfg = config.get("strategy", {})
+        self.strategy_timeframe_name: str = strategy_cfg.get("timeframe", "M15")
+        self.strategy_lookback_bars: int = strategy_cfg.get("lookback_bars", 300)
+        self.strategy_zone_max_age_bars: int = strategy_cfg.get("zone_max_age_bars", 20)
+
         # ---- Rule 1: exactly one slot, ever - never a collection ----
         self.position: Optional[PositionState] = None
 
-        # The initial straddle's two pending orders exist BEFORE any
-        # position is open, so they're not owned by the single position
-        # slot - tracked separately here until the first fill consumes it.
+        # The single directional entry order (BUY LIMIT or SELL LIMIT at
+        # the order-block zone) exists BEFORE any position is open, so
+        # it's not owned by the single position slot - tracked separately
+        # here until the fill consumes it. Reuses the same list shape the
+        # old straddle used; at most one ticket lives here now instead of
+        # two, since entries are directional, not both-sides-at-once.
         self.pending_straddle_tickets: List[int] = []
+
+        # Bookkeeping only, so the same confirmed structure signal doesn't
+        # get re-submitted as a fresh order every tick while its pending
+        # order is still waiting to fill or has just been cancelled/expired.
+        self._last_acted_bos_index: Optional[int] = None
 
         # Once we discover which ORDER_FILLING_* mode this broker/symbol
         # actually accepts, we remember it so every later order tries the
@@ -424,7 +449,106 @@ class SARTradeEngine:
         return valid_price
 
     # ------------------------------------------------------------------
-    # Initial straddle (pre-position bootstrapping only)
+    # Structure-driven directional entry (replaces the blind straddle)
+    # ------------------------------------------------------------------
+
+    def get_recent_bars(self) -> List[Bar]:
+        """Pulls the last N completed bars for the configured strategy
+        timeframe straight from MT5 - source of truth every call, nothing
+        cached. Returns [] if unavailable so callers just skip this tick
+        rather than trading on stale or missing data."""
+        if not MT5_AVAILABLE or not self._connected:
+            return []
+        tf = _resolve_timeframe(self.strategy_timeframe_name)
+        if tf is None:
+            self._log(f"Unknown strategy timeframe '{self.strategy_timeframe_name}' - skipping entry scan.")
+            return []
+        rates = mt5.copy_rates_from_pos(self.symbol, tf, 1, self.strategy_lookback_bars)
+        if rates is None or len(rates) == 0:
+            return []
+        return [
+            Bar(time=int(r["time"]), open=float(r["open"]), high=float(r["high"]),
+                low=float(r["low"]), close=float(r["close"]))
+            for r in rates
+        ]
+
+    def place_directional_entry(self, current_price: float) -> None:
+        """First-run only (no position open, no entry order already
+        pending): scans recent structure for the latest confirmed
+        BOS + order-block signal and, if it's fresh and its entry zone
+        hasn't already been passed by price, places a single BUY LIMIT or
+        SELL LIMIT at that zone's midpoint - never both directions, since
+        the direction is now decided by structure, not left to whichever
+        side price reaches first."""
+        bars = self.get_recent_bars()
+        if not bars:
+            return
+
+        signal = latest_signal(bars)
+        if signal is None:
+            return
+
+        if signal.bos_index == self._last_acted_bos_index:
+            return
+
+        zone_still_forming_or_stale = (len(bars) - 1 - signal.bos_index) > self.strategy_zone_max_age_bars
+        if zone_still_forming_or_stale:
+            self._last_acted_bos_index = signal.bos_index
+            self._log(f"Signal {signal.direction} at bos_index={signal.bos_index} is stale "
+                      f"(zone formed too long ago) - skipping.")
+            return
+
+        if signal.direction == "BUY" and current_price <= signal.zone_low:
+            self._last_acted_bos_index = signal.bos_index
+            self._log(f"BUY signal zone [{signal.zone_low:.2f}, {signal.zone_high:.2f}] already "
+                      f"passed by price ({current_price:.2f}) - skipping, too late to enter.")
+            return
+        if signal.direction == "SELL" and current_price >= signal.zone_high:
+            self._last_acted_bos_index = signal.bos_index
+            self._log(f"SELL signal zone [{signal.zone_low:.2f}, {signal.zone_high:.2f}] already "
+                      f"passed by price ({current_price:.2f}) - skipping, too late to enter.")
+            return
+
+        quote = self.get_bid_ask()
+        if quote is None:
+            self._log("Cannot place directional entry - no live bid/ask available.")
+            return
+        bid, ask = quote
+        entry_price = round(signal.entry_price, 2)
+
+        self._last_acted_bos_index = signal.bos_index
+
+        if not MT5_AVAILABLE:
+            self._log(f"[SIMULATED] Directional entry: {signal.direction} LIMIT @ {entry_price} "
+                      f"(zone {signal.zone_low:.2f}-{signal.zone_high:.2f})")
+            return
+
+        common = dict(
+            action=mt5.TRADE_ACTION_PENDING,
+            symbol=self.symbol,
+            volume=self.lot_size,
+            magic=self.magic,
+            comment=self.comment,
+            type_time=mt5.ORDER_TIME_GTC,
+        )
+        if signal.direction == "BUY":
+            req = {**common, "type": mt5.ORDER_TYPE_BUY_LIMIT, "price": entry_price}
+        else:
+            req = {**common, "type": mt5.ORDER_TYPE_SELL_LIMIT, "price": entry_price}
+
+        r = self._send_order_with_filling_retry(req)
+        if r and r.retcode == mt5.TRADE_RETCODE_DONE:
+            self.pending_straddle_tickets.append(r.order)
+            self._log(f"Directional entry placed: {signal.direction} LIMIT @ {entry_price} "
+                      f"(zone {signal.zone_low:.2f}-{signal.zone_high:.2f}, "
+                      f"IDM idx={signal.idm_index}, BOS idx={signal.bos_index})")
+        else:
+            retcode = getattr(r, "retcode", None)
+            self._log(f"Directional entry order rejected (retcode={retcode}) - will retry next cycle.")
+
+    # ------------------------------------------------------------------
+    # Legacy: initial straddle (kept for reference/rollback, no longer
+    # called from tick() - see place_directional_entry above)
     # ------------------------------------------------------------------
 
     def place_straddle(self, mid_price: float) -> None:
@@ -808,7 +932,7 @@ class SARTradeEngine:
                     now = time.time()
                     if now - self._last_straddle_attempt >= self._straddle_retry_interval_seconds:
                         self._last_straddle_attempt = now
-                        self.place_straddle(price)
+                        self.place_directional_entry(price)
 
                 had_position_before = self.position is not None
                 self._reconcile_position()
@@ -844,7 +968,7 @@ class SARTradeEngine:
             }
 
         if self.pending_straddle_tickets:
-            pending_desc = f"{len(self.pending_straddle_tickets)} straddle order(s) live"
+            pending_desc = f"{len(self.pending_straddle_tickets)} directional entry order(s) live"
         elif position_state is not None:
             pending_desc = "stop order live" if position_state["has_stop_order"] else "NO STOP ORDER - placing"
         else:

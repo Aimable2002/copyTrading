@@ -158,6 +158,7 @@ def create_api_app(
         user_id = _authenticate(authorization)
         try:
             agent, instance_dir, terminal_path, outcome, account_id = provision_account_start(
+                user_id=user_id,
                 role=body.role,
                 login=body.login,
                 password=body.password,

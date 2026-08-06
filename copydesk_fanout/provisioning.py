@@ -158,6 +158,44 @@ def _legacy_display_path(instance_dir: Path) -> str:
 ConnectOutcome = Literal["connected", "stalled"]
 
 
+def _insert_placeholder_account(*, account_id: str, user_id: str, role: Role, supabase_client: Any) -> None:
+    """
+    Inserted before claim_instance() so instance_pool.claimed_by_account_id has a row
+    in "accounts" to point at (accounts.status defaults to 'provisioning' in the
+    schema, set explicitly here for clarity) - the FK on that column requires the
+    account to already exist, but the real row (status="live", real
+    metatrader_dir_path) can't be built until the terminal has actually connected.
+    finalize_provisioned_account() upgrades this row in place via upsert;
+    _mark_placeholder_account_failed() records why instead if provisioning fails
+    before that point.
+    """
+    execute_with_retry(
+        lambda: supabase_client.table("accounts").insert(
+            {
+                "account_id": account_id,
+                "user_id": user_id,
+                "role": role,
+                "status": "provisioning",
+            }
+        ).execute()
+    )
+
+
+def _mark_placeholder_account_failed(*, account_id: str, reason: str, supabase_client: Any) -> None:
+    """
+    Updates the row _insert_placeholder_account() created to status="failed" with
+    provisioning_error=reason, for when provisioning fails before
+    finalize_provisioned_account() gets to upgrade it to "live". Scoped to
+    status="provisioning" in the WHERE clause so this can never overwrite a real,
+    already-finalized account row even in a pathological account_id collision.
+    """
+    execute_with_retry(
+        lambda: supabase_client.table("accounts").update(
+            {"status": "failed", "provisioning_error": reason}
+        ).eq("account_id", account_id).eq("status", "provisioning").execute()
+    )
+
+
 def _wait_fast(agent: TerminalAgent, timeout: float = _CONNECT_TIMEOUT_SECONDS) -> ConnectOutcome:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -218,12 +256,15 @@ def generate_account_id(role: Role) -> str:
 
 
 def _start_terminal_and_agent(
-    *, account_id: str, role: Role, login: str, password: str, server: str, fanout: FanoutCore,
+    *, account_id: str, user_id: str, role: Role, login: str, password: str, server: str, fanout: FanoutCore,
     supabase_client: Any,
 ) -> tuple[TerminalAgent, Path, str]:
+    _insert_placeholder_account(account_id=account_id, user_id=user_id, role=role, supabase_client=supabase_client)
+
     try:
         pool_row = instance_pool.claim_instance(role=role, account_id=account_id, supabase_client=supabase_client)
     except PoolError as exc:
+        _mark_placeholder_account_failed(account_id=account_id, reason=str(exc), supabase_client=supabase_client)
         raise ProvisioningError(str(exc)) from exc
 
     instance_dir = Path(pool_row["instance_dir"])
@@ -264,11 +305,15 @@ def _start_terminal_and_agent(
         # (it degrades to relying on the stalled-wait timeout only); see that function.
         agent.terminal_process = None
         return agent, instance_dir, terminal_path
-    except ProvisioningError:
+    except ProvisioningError as exc:
         instance_pool.release_instance(account_id=account_id, supabase_client=supabase_client)
+        _mark_placeholder_account_failed(account_id=account_id, reason=str(exc), supabase_client=supabase_client)
         raise
     except Exception as exc:  
         instance_pool.release_instance(account_id=account_id, supabase_client=supabase_client)
+        _mark_placeholder_account_failed(
+            account_id=account_id, reason=f"Unexpected provisioning failure: {exc}", supabase_client=supabase_client,
+        )
         raise ProvisioningError(f"Unexpected provisioning failure: {exc}") from exc
 
 
@@ -295,7 +340,7 @@ def finalize_provisioned_account(
     account_user_map[account_id] = user_id
 
     execute_with_retry(
-        lambda: supabase_client.table("accounts").insert(
+        lambda: supabase_client.table("accounts").upsert(
             {
                 "account_id": account_id,
                 "user_id": user_id,
@@ -343,16 +388,17 @@ def provision_account(
 
     account_id = account_id or generate_account_id(role)
     agent, instance_dir, terminal_path = _start_terminal_and_agent(
-        account_id=account_id, role=role, login=login, password=password, server=server, fanout=fanout,
-        supabase_client=supabase_client,
+        account_id=account_id, user_id=user_id, role=role, login=login, password=password, server=server,
+        fanout=fanout, supabase_client=supabase_client,
     )
 
     outcome = _wait_fast(agent)
     if outcome == "stalled":
         try:
             _wait_stalled(agent)
-        except ProvisioningError:
+        except ProvisioningError as exc:
             instance_pool.release_instance(account_id=account_id, supabase_client=supabase_client)
+            _mark_placeholder_account_failed(account_id=account_id, reason=str(exc), supabase_client=supabase_client)
             raise
 
     finalize_provisioned_account(
@@ -366,6 +412,7 @@ def provision_account(
 
 def provision_account_start(
     *,
+    user_id: str,
     role: Role,
     login: str,
     password: str,
@@ -382,8 +429,8 @@ def provision_account_start(
 
     account_id = account_id or generate_account_id(role)
     agent, instance_dir, terminal_path = _start_terminal_and_agent(
-        account_id=account_id, role=role, login=login, password=password, server=server, fanout=fanout,
-        supabase_client=supabase_client,
+        account_id=account_id, user_id=user_id, role=role, login=login, password=password, server=server,
+        fanout=fanout, supabase_client=supabase_client,
     )
     outcome = _wait_fast(agent)
     return agent, instance_dir, terminal_path, outcome, account_id
@@ -407,8 +454,9 @@ def provision_account_finish(
 ) -> None:
     try:
         _wait_stalled(agent)
-    except ProvisioningError:
+    except ProvisioningError as exc:
         instance_pool.release_instance(account_id=account_id, supabase_client=supabase_client)
+        _mark_placeholder_account_failed(account_id=account_id, reason=str(exc), supabase_client=supabase_client)
         raise
 
     finalize_provisioned_account(
