@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from . import account_lifecycle, billing, challenges, master_profiles, master_rate, profit_share, roster, trade_history, wallet
+from . import account_lifecycle, billing, challenges, master_profiles, master_rate, payouts, profit_share, roster, trade_history, wallet
 from .account_lifecycle import LifecycleError
 from .billing import BillingError
 from .challenges import ChallengeError
@@ -84,6 +84,12 @@ class EnrollChallengeRequest(BaseModel):
     challenge_id: str
 
 
+class RequestPayoutRequest(BaseModel):
+    amount: float
+    recipient_name: str
+    recipient_phone: str
+
+
 def _authenticate(authorization: str | None) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token")
@@ -136,6 +142,12 @@ def create_api_app(
     agents: list,
 ) -> FastAPI:
     app = FastAPI(title="CopyDesk provisioning API")
+
+    # Own prefix (/admin), own auth check (_authenticate_admin) - isolated
+    # from every existing route above so this addition can't change the
+    # behavior of anything that was already working.
+    from .admin_routes import build_admin_router
+    app.include_router(build_admin_router(fanout=fanout, supabase_client=supabase_client))
 
     app.add_middleware(
         CORSMiddleware,
@@ -407,6 +419,29 @@ def create_api_app(
         if role != "master":
             raise HTTPException(status_code=422, detail="Only master accounts have earnings")
         return profit_share.get_master_earnings(account_id, supabase_client)
+
+    @app.get("/masters/{account_id}/payouts")
+    def list_own_payouts(account_id: str, authorization: str | None = Header(default=None)):
+        user_id = _authenticate(authorization)
+        role = _resolve_account_owner(account_user_map, account_id, user_id)
+        if role != "master":
+            raise HTTPException(status_code=422, detail="Only master accounts have payouts")
+        return payouts.list_payouts_for_master(account_id, supabase_client)
+
+    @app.post("/masters/{account_id}/payouts")
+    def create_payout_request(
+        account_id: str, body: RequestPayoutRequest, authorization: str | None = Header(default=None),
+    ):
+        user_id = _authenticate(authorization)
+        role = _resolve_account_owner(account_user_map, account_id, user_id)
+        if role != "master":
+            raise HTTPException(status_code=422, detail="Only master accounts have payouts")
+        try:
+            return payouts.request_payout(
+                account_id, body.amount, body.recipient_name, body.recipient_phone, supabase_client,
+            )
+        except payouts.PayoutError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # ----------------------------------------------------------------
     # Challenges - browsing/enrolling/status/history. Challenge CRUD

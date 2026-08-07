@@ -225,6 +225,23 @@ def _set_current(billing_period_id: str, follower_account_id: str, roster_slot_i
     )
 
 
+def count_active_followers(master_account_id: str, supabase_client: Any) -> int:
+    """Admin-only: how many followers currently have this master as their
+    active subscription. Reads `subscriptions` (the live trade-routing
+    table), not `roster_slots` (billing-period history) - `active=True`
+    rows are the ones actually being copied right now."""
+    response = execute_with_retry(
+        lambda: (
+            supabase_client.table("subscriptions")
+            .select("follower_account_id", count="exact")
+            .eq("master_account_id", master_account_id)
+            .eq("active", True)
+            .execute()
+        )
+    )
+    return response.count or 0
+
+
 def get_current_slot(billing_period_id: str, follower_account_id: str, supabase_client: Any) -> dict | None:
     response = execute_with_retry(
         lambda: (

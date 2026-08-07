@@ -115,6 +115,46 @@ def list_public_masters(supabase_client: Any) -> list[dict]:
     ]
 
 
+def list_all_masters(supabase_client: Any) -> list[dict]:
+    """Admin-only view: every master profile regardless of is_public or
+    account status. Deliberately separate from list_public_masters rather
+    than adding a flag to it - that function's contract (public masters
+    only) is depended on by the public directory route and must not change."""
+    profiles_response = execute_with_retry(
+        lambda: (
+            supabase_client.table("master_profiles")
+            .select("master_account_id, display_name, bio, is_public")
+            .execute()
+        )
+    )
+    profiles = profiles_response.data or []
+    if not profiles:
+        return []
+
+    account_ids = [p["master_account_id"] for p in profiles]
+    status_response = execute_with_retry(
+        lambda: (
+            supabase_client.table("accounts")
+            .select("account_id, status")
+            .in_("account_id", account_ids)
+            .execute()
+        )
+    )
+    status_by_id = {row["account_id"]: row["status"] for row in (status_response.data or [])}
+
+    return [
+        {
+            "account_id": p["master_account_id"],
+            "display_name": p["display_name"],
+            "bio": p["bio"],
+            "is_public": p["is_public"],
+            "account_status": status_by_id.get(p["master_account_id"], "unknown"),
+            "rate_percent": _get_rate_or_none(p["master_account_id"], supabase_client),
+        }
+        for p in profiles
+    ]
+
+
 def _get_rate_or_none(master_account_id: str, supabase_client: Any) -> float | None:
     from .master_rate import get_public_rate
     rate = get_public_rate(master_account_id, supabase_client)

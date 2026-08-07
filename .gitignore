@@ -9,6 +9,7 @@ java/
 dotnet/
 diagnostics/
 resources/
+bot/
 __pycache__/
 *.pyc
 *.pyo

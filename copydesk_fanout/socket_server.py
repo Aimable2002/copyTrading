@@ -34,7 +34,7 @@ def verify_supabase_jwt(token: str) -> str:
         payload = jwt.decode(token, secret, algorithms=["HS256"], audience="authenticated", leeway=1200)
     else:
         signing_key = _get_jwks_client().get_signing_key_from_jwt(token)
-        payload = jwt.decode(token, signing_key.key, algorithms=[algorithm], audience="authenticated")
+        payload = jwt.decode(token, signing_key.key, algorithms=[algorithm], audience="authenticated", leeway=1200)
 
     return payload["sub"]
 
