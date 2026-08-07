@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .sizing import SizingMode
+from ..infra.supabase_client import execute_with_retry, async_execute_with_retry, get_async_supabase_client
 
 logger = logging.getLogger("config_store")
 
@@ -76,7 +77,6 @@ class ConfigStore:
             self.set_config(master_account_id, followers)
 
     def load_from_supabase(self, supabase_client: Any) -> None:
-        from .supabase_client import execute_with_retry
 
         response = execute_with_retry(
             lambda: supabase_client.table("subscriptions").select("*").eq("active", True).execute()
@@ -114,7 +114,6 @@ class ConfigStore:
             await asyncio.sleep(delay)
 
     async def _realtime_sync_coro(self) -> None:
-        from .supabase_client import async_execute_with_retry, get_async_supabase_client
 
         client = await get_async_supabase_client()
 

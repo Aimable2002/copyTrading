@@ -5,8 +5,8 @@ from typing import Any
 
 from postgrest.exceptions import APIError
 
-from .billing import wallet
-from .infra.supabase_client import execute_with_retry
+from ..billing import wallet
+from ..infra.supabase_client import execute_with_retry
 
 logger = logging.getLogger("roster")
 

@@ -23,26 +23,28 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 # from . import account_lifecycle, billing, challenges, master_profiles, master_rate, payouts, profit_share, roster, trade_history, wallet
-from .provisioning import account_lifecycle, roster
-from .masters import challenges, master_profiles
-from .billing import billing, master_rate, payouts, profit_share, wallet
-from .core import trade_history
-from .provisioning.account_lifecycle import LifecycleError
-from .billing.billing import BillingError
-from .masters.challenges import ChallengeError
-from .core.fanout_core import FanoutCore
-from .masters.master_profiles import MasterProfileError
-from .billing.master_rate import MasterRateError
-from .provisioning.provisioning import (
+from ..provisioning import account_lifecycle
+from ..masters import challenges, master_profiles, roster
+from ..billing import billing, master_rate, payouts, profit_share, wallet
+from ..core import trade_history
+from ..provisioning.account_lifecycle import LifecycleError
+from ..billing.billing import BillingError
+from ..masters.challenges import ChallengeError
+from ..core.fanout_core import FanoutCore
+from ..masters.master_profiles import MasterProfileError
+from ..billing.master_rate import MasterRateError
+from ..provisioning.provisioning import (
     ProvisioningError,
     finalize_provisioned_account,
     provision_account_finish,
     provision_account_start,
 )
-from .masters.roster import RosterError
-from .core.sizing import SizingMode
+from ..masters.roster import RosterError
+from ..core.sizing import SizingMode
 from .socket_server import verify_supabase_jwt
-from .billing.wallet import WalletError
+from ..billing.wallet import WalletError
+
+from .admin_routes import build_admin_router
 
 logger = logging.getLogger("api_server")
 
@@ -150,7 +152,6 @@ def create_api_app(
     # Own prefix (/admin), own auth check (_authenticate_admin) - isolated
     # from every existing route above so this addition can't change the
     # behavior of anything that was already working.
-    from .admin_routes import build_admin_router
     app.include_router(build_admin_router(fanout=fanout, supabase_client=supabase_client))
 
     app.add_middleware(

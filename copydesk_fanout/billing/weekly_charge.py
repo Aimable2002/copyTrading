@@ -6,9 +6,9 @@ from typing import Any
 
 # from . import billing, trade_history, wallet
 from . import billing, wallet
-from .core import trade_history
-from .provisioning.account_lifecycle import LifecycleError, pause_account
-from .infra.supabase_client import execute_with_retry
+from ..core import trade_history
+from ..provisioning.account_lifecycle import LifecycleError, pause_account
+from ..infra.supabase_client import execute_with_retry
 
 logger = logging.getLogger("weekly_charge")
 

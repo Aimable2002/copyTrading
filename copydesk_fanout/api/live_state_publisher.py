@@ -4,9 +4,9 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
-from .core.base_agent import BaseAgent
+from ..core.base_agent import BaseAgent
 from .socket_server import emit_account_state
-from .infra.supabase_client import execute_with_retry
+from ..infra.supabase_client import execute_with_retry
 
 if TYPE_CHECKING:
     from .core.fanout_core import FanoutCore

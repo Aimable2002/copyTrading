@@ -5,7 +5,7 @@ from typing import Any
 
 from postgrest.exceptions import APIError
 
-from .infra.supabase_client import execute_with_retry
+from ..infra.supabase_client import execute_with_retry
 
 logger = logging.getLogger("challenges")
 

@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from .infra.supabase_client import execute_with_retry
+from ..infra.supabase_client import execute_with_retry
+from ..billing.master_rate import get_public_rate
 
 logger = logging.getLogger("master_profiles")
 
@@ -156,6 +157,5 @@ def list_all_masters(supabase_client: Any) -> list[dict]:
 
 
 def _get_rate_or_none(master_account_id: str, supabase_client: Any) -> float | None:
-    from .master_rate import get_public_rate
     rate = get_public_rate(master_account_id, supabase_client)
     return rate["rate_percent"] if rate else None

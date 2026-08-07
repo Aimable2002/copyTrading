@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from .infra.supabase_client import execute_with_retry
+from ..infra.supabase_client import execute_with_retry
 
 logger = logging.getLogger("wallet")
 

@@ -8,13 +8,13 @@ import uuid
 from pathlib import Path
 
 from . import instance_pool
-from .provisioning.provisioning import (
+from ..provisioning.provisioning import (
     ProvisioningError,
     _clone_template,
     _terminal_exe_path,
     _unlock_and_remove,
 )
-from .infra.supabase_client import get_supabase_client
+from ..infra.supabase_client import get_supabase_client
 
 logger = logging.getLogger("register_pool_instance")
 

@@ -4,10 +4,10 @@ import logging
 from typing import Any, Literal
 
 from . import instance_pool
-from .core.fanout_core import FanoutCore
-from .core.follower_agent import FollowerAgent
-from .infra.supabase_client import execute_with_retry
-from .core.terminal_agent import TerminalAgent
+from ..core.fanout_core import FanoutCore
+from ..core.follower_agent import FollowerAgent
+from ..infra.supabase_client import execute_with_retry
+from ..core.terminal_agent import TerminalAgent
 
 logger = logging.getLogger("account_lifecycle")
 

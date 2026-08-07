@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import profit_share
-from .infra.supabase_client import execute_with_retry
+from ..infra.supabase_client import execute_with_retry
 
 logger = logging.getLogger("payouts")
 

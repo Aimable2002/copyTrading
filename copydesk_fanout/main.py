@@ -12,6 +12,21 @@ from .core.follower_agent import FollowerAgent
 from .core.order_pair_store import OrderPairStore
 from .core.terminal_agent import TerminalAgent
 
+import os
+
+from .infra.supabase_client import execute_with_retry, get_supabase_client
+from .provisioning.provisioning import ProvisioningError, read_provisioned_credentials, resolve_instance_dir
+
+import asyncio
+
+import socketio as socketio_lib
+import uvicorn
+
+from .billing import billing, weekly_charge
+from .api.api_server import create_api_app
+from .api.live_state_publisher import run_live_state_publisher
+from .api.socket_server import sio
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("main")
 
@@ -69,10 +84,6 @@ def _run_local_file_mode(config_path: Path) -> None:
 
 
 def _run_supabase_mode(serve: bool) -> None:
-    import os
-
-    from .supabase_client import execute_with_retry, get_supabase_client
-    from .provisioning import ProvisioningError, read_provisioned_credentials, resolve_instance_dir
 
     supabase = get_supabase_client()
 
@@ -173,16 +184,6 @@ def _run_agents_with_server(
     account_user_map: dict[str, str],
     pair_store: OrderPairStore,
 ) -> None:
-    import asyncio
-    import os
-
-    import socketio as socketio_lib
-    import uvicorn
-
-    from . import billing, weekly_charge
-    from .api_server import create_api_app
-    from .live_state_publisher import run_live_state_publisher
-    from .socket_server import sio
 
     for agent in agents:
         agent.start()
