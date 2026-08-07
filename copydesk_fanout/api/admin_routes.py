@@ -7,8 +7,12 @@ from typing import Any
 import jwt
 from fastapi import APIRouter, Header, HTTPException
 
-from . import master_profiles, master_rate, payouts, profit_share, roster, trade_history
+# from . import master_profiles, master_rate, payouts, profit_share, roster, trade_history
 from . import admin_analytics
+
+from .masters import master_profiles, roster
+from .billing import payouts, profit_share, master_rate
+from .core import trade_history
 from .socket_server import _get_jwks_client
 
 logger = logging.getLogger("admin_routes")

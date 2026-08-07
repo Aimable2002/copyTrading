@@ -22,23 +22,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from . import account_lifecycle, billing, challenges, master_profiles, master_rate, payouts, profit_share, roster, trade_history, wallet
-from .account_lifecycle import LifecycleError
-from .billing import BillingError
-from .challenges import ChallengeError
-from .fanout_core import FanoutCore
-from .master_profiles import MasterProfileError
-from .master_rate import MasterRateError
-from .provisioning import (
+# from . import account_lifecycle, billing, challenges, master_profiles, master_rate, payouts, profit_share, roster, trade_history, wallet
+from .provisioning import account_lifecycle, roster
+from .masters import challenges, master_profiles
+from .billing import billing, master_rate, payouts, profit_share, wallet
+from .core import trade_history
+from .provisioning.account_lifecycle import LifecycleError
+from .billing.billing import BillingError
+from .masters.challenges import ChallengeError
+from .core.fanout_core import FanoutCore
+from .masters.master_profiles import MasterProfileError
+from .billing.master_rate import MasterRateError
+from .provisioning.provisioning import (
     ProvisioningError,
     finalize_provisioned_account,
     provision_account_finish,
     provision_account_start,
 )
-from .roster import RosterError
-from .sizing import SizingMode
+from .masters.roster import RosterError
+from .core.sizing import SizingMode
 from .socket_server import verify_supabase_jwt
-from .wallet import WalletError
+from .billing.wallet import WalletError
 
 logger = logging.getLogger("api_server")
 

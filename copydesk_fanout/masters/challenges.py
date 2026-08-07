@@ -1,42 +1,3 @@
-"""
-Challenge/graduation system - masters commit to a challenge, pass it to
-graduate (become is_public, eligible for challenge_reward payouts), or get
-gated from enrolling in anything beyond the fixed challenge 1 until they
-have.
-
-Enrollment is BACKEND-validated deliberately, not left to Supabase RLS
-alone - "has this master ever passed challenge 1" is a cross-table history
-check (master_challenge_enrollments joined against challenges.is_fixed),
-not a simple row-ownership rule RLS is good at expressing.
-
-Challenge CRUD itself (create/edit a challenge, criteria, reward amount)
-is NOT here - that's a direct-Supabase admin surface per policy (plain
-config writes, no business logic on write). list_challenges() below is a
-read-only convenience so the frontend has one consistent REST shape for
-everything challenge-related that ISN'T pure admin config.
-
-'phase' is deliberately NOT a stored column anywhere - it's derived fresh
-from enrollment history (has this master ever passed the fixed challenge)
-every time it's asked for. Same reasoning is_public is trigger-derived
-rather than master-editable: one source of truth (history), not a second
-flag that can drift out of sync with it.
-
-No embedded/joined Supabase selects anywhere in this module, on purpose -
-matches every other module in this codebase (see order_pair_store.py,
-config_store.py, billing.py), which always does plain flat queries and
-resolves any cross-table lookups as a separate call rather than relying on
-PostgREST's foreign-key embed syntax.
-
-NOT COVERED HERE: monthly evaluation (computing win rate/profit factor/
-drawdown against a challenge's criteria, deciding pass/fail, and calling
-record_challenge_reward below) and the real-time drawdown circuit breaker.
-Both need a live port of the frontend's trades.ts metrics logic into
-Python plus a scheduled job - genuinely separate, larger pieces, not
-built yet. This module only covers what the frontend directly needs to
-stop being mock: browsing, enrolling, leaving, and reading
-enrollment/history state.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -44,7 +5,7 @@ from typing import Any
 
 from postgrest.exceptions import APIError
 
-from .supabase_client import execute_with_retry
+from .infra.supabase_client import execute_with_retry
 
 logger = logging.getLogger("challenges")
 

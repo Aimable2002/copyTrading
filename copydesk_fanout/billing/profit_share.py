@@ -4,9 +4,12 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import roster, trade_history, wallet
+# from . import roster, trade_history, wallet
+from .core import trade_history
+from . import wallet
+from .master import roster
 from .master_rate import get_copy_rate_for_slot
-from .supabase_client import execute_with_retry
+from .infra.supabase_client import execute_with_retry
 
 logger = logging.getLogger("profit_share")
 

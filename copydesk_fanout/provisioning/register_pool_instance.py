@@ -1,31 +1,3 @@
-"""
-Operator-run script to grow the instance pool.
-
-    python -m copydesk_fanout.register_pool_instance --role master --count 3
-    python -m copydesk_fanout.register_pool_instance --role follower --count 5 --settle-seconds 120
-
-This is the ONLY place in the system that still clones the template and
-launches a fresh terminal - deliberately moved out of the request path
-(see provisioning.py's module-level comment). Run this manually, ahead
-of expected demand, watched by a human:
-
-  1. Clones TEMPLATE_TERMINAL_DIR into a new directory under INSTANCES_DIR.
-  2. Launches that terminal in portable mode with NO login - it comes up
-     at the blank login screen, which is what forces it through any
-     pending update/restart cycle without needing (or exposing) real
-     account credentials.
-  3. Waits --settle-seconds for the process to stabilize, then confirms
-     it's still alive (not crashed, not stuck in an update loop).
-  4. Registers it in instance_pool as 'available'.
-
-If a terminal doesn't survive the settle window, its directory is
-cleaned up and it's skipped - it does NOT get registered half-working.
-Re-run the script to retry.
-
-Requires the same env vars as provisioning.py: TEMPLATE_TERMINAL_DIR,
-INSTANCES_DIR, and (for Supabase) SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -36,13 +8,13 @@ import uuid
 from pathlib import Path
 
 from . import instance_pool
-from .provisioning import (
+from .provisioning.provisioning import (
     ProvisioningError,
     _clone_template,
     _terminal_exe_path,
     _unlock_and_remove,
 )
-from .supabase_client import get_supabase_client
+from .infra.supabase_client import get_supabase_client
 
 logger = logging.getLogger("register_pool_instance")
 

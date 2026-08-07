@@ -5,8 +5,10 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import master_profiles, master_rate, profit_share, roster
-from .supabase_client import execute_with_retry
+# from . import master_profiles, master_rate, profit_share, roster
+from .masters import master_profiles, roster
+from .billing import master_rate, profit_share
+from .infra.supabase_client import execute_with_retry
 
 logger = logging.getLogger("admin_analytics")
 

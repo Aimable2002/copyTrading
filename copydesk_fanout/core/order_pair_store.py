@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .supabase_client import execute_with_retry
+from .infra.supabase_client import execute_with_retry
 
 logger = logging.getLogger("order_pair_store")
 

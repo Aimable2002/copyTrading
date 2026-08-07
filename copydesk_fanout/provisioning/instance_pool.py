@@ -1,39 +1,10 @@
-"""
-Pool of pre-warmed, already-running MT5 terminal instances.
-
-This is the piece that replaces per-request clone+launch+wait-for-update
-in provisioning.py. All of that expensive, flaky work now happens exactly
-once per terminal, offline, run manually by an operator via
-scripts/register_pool_instance.py - never on a user's provisioning
-request.
-
-Lifecycle of one pool row:
-  1. register_instance() - operator script inserts it as 'available'
-     after confirming the terminal is up and stable. No account is
-     logged into it yet.
-  2. claim_instance() - a provisioning request atomically takes it,
-     'available' -> 'claimed', tagged with the account_id that owns it.
-  3. release_instance() - account_lifecycle.close_account() calls this on
-     close. The account's on-disk credentials are deleted and the row
-     goes back to 'available' for the NEXT claimant.
-
-The terminal process itself is never stopped across this whole lifecycle.
-That's the point - a pool instance is meant to run indefinitely, so no
-account ever pays the update/restart tax that motivated this module.
-There's no supported "log out to blank" call in the MetaTrader5 API, so
-step 3 doesn't attempt one: what "signed out" means here is that the
-account's credentials no longer exist anywhere in this system or on disk,
-and nothing is polling or trading on that instance until the next
-claimant's login overwrites whatever session is sitting on it.
-"""
-
 from __future__ import annotations
 
 import logging
 from pathlib import Path
 from typing import Any, Literal
 
-from .supabase_client import execute_with_retry
+from .infra.supabase_client import execute_with_retry
 
 logger = logging.getLogger("instance_pool")
 

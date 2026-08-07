@@ -5,8 +5,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import wallet
-from .account_lifecycle import LifecycleError, close_account, pause_account
-from .supabase_client import execute_with_retry
+from .provisioning.account_lifecycle import LifecycleError, close_account, pause_account
+from .infra.supabase_client import execute_with_retry
 
 logger = logging.getLogger("billing")
 

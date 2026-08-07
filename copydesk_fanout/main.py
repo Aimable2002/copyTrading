@@ -6,11 +6,11 @@ import logging
 import time
 from pathlib import Path
 
-from .config_store import ConfigStore
-from .fanout_core import FanoutCore
-from .follower_agent import FollowerAgent
-from .order_pair_store import OrderPairStore
-from .terminal_agent import TerminalAgent
+from .core.config_store import ConfigStore
+from .core.fanout_core import FanoutCore
+from .core.follower_agent import FollowerAgent
+from .core.order_pair_store import OrderPairStore
+from .core.terminal_agent import TerminalAgent
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("main")
@@ -289,7 +289,7 @@ def _run_agents(agents: list[TerminalAgent]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="CopyDesk fanout backend (DWX Connect based)")
+    parser = argparse.ArgumentParser(description="CopyDesk fanout backend (Connect based)")
     parser.add_argument("--config", default=None, help="Path to local config JSON (offline/local-testing mode)")
     parser.add_argument("--supabase", action="store_true", help="Run in Supabase-backed production mode")
     parser.add_argument(

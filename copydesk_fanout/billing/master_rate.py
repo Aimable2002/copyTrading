@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from .supabase_client import execute_with_retry
+from .infra.supabase_client import execute_with_retry
 
 logger = logging.getLogger("master_rate")
 

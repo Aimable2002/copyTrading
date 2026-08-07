@@ -4,9 +4,11 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import billing, trade_history, wallet
-from .account_lifecycle import LifecycleError, pause_account
-from .supabase_client import execute_with_retry
+# from . import billing, trade_history, wallet
+from . import billing, wallet
+from .core import trade_history
+from .provisioning.account_lifecycle import LifecycleError, pause_account
+from .infra.supabase_client import execute_with_retry
 
 logger = logging.getLogger("weekly_charge")
 
