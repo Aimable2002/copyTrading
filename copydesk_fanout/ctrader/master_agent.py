@@ -94,6 +94,15 @@ class CTraderMasterAgent:
     # -- lifecycle ---------------------------------------------------------- #
 
     def start(self) -> None:
+        if self._connected:
+            # Already authenticated - e.g. main.py starts cTrader master agents
+            # eagerly (right after construction, before fanout.reconcile_all())
+            # so self._ctid is populated in time for reconciliation, and then
+            # calls start() again later along with every other agent. Guard
+            # against redoing the account auth handshake in that second call.
+            logger.debug("[%s] start() called again - already connected, skipping", self.account_id)
+            return
+
         self._ctid = token_store.get_ctid_trading_account_id(self.account_id, self._supabase_client)
         self._symbols = symbol_map.SymbolCache(self._ctid)
 

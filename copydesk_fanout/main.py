@@ -123,6 +123,16 @@ def _run_supabase_mode(serve: bool) -> None:
                 on_trade_event=fanout.handle_master_trade_event,
                 supabase_client=supabase,
             )
+            # Unlike TerminalAgent (MT5), whose file-based terminal connector
+            # is already live from __init__, CTraderMasterAgent only resolves
+            # its ctidTraderAccountId and authenticates with cTrader inside
+            # start(). fanout.reconcile_all() below runs before the generic
+            # "for agent in agents: agent.start()" loop, so without starting
+            # it here first, reconcile() would send ProtoOAReconcileReq with
+            # ctidTraderAccountId still unset (None), causing an EncodeError.
+            # start() is idempotent, so the later generic start() call is a
+            # harmless no-op for this agent.
+            agent.start()
             fanout.register_master(agent)
             agents.append(agent)
             logger.info("Registered ctrader master: %s", account["account_id"])
