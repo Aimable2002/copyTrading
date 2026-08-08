@@ -14,13 +14,19 @@ Supabase JWT secret).
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Literal
+from urllib.parse import urlencode
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
+
+from ..ctrader import oauth as ctrader_oauth
+from ..ctrader import pending_consent as ctrader_pending_consent
+from ..ctrader.provisioning import CTraderProvisioningError, provision_ctrader_account
 
 # from . import account_lifecycle, billing, challenges, master_profiles, master_rate, payouts, profit_share, roster, trade_history, wallet
 from ..provisioning import account_lifecycle
@@ -220,6 +226,60 @@ def create_api_app(
 
         background_tasks.add_task(_resume_after_stall)
         return {"account_id": account_id, "status": "awaiting_attention"}
+
+    @app.post("/accounts/ctrader/start")
+    def ctrader_start(authorization: str | None = Header(default=None)):
+        """Returns a Spotware authorization_url. Frontend does a full-page
+        redirect to it - not a fetch - since the consent step is Spotware's own
+        hosted page, not something this API can proxy. See ctrader/oauth.py.
+
+        cTrader's OAuth implementation does not round-trip a `state` param back
+        to the callback (confirmed against a live run - only `code` arrives) -
+        so who-initiated-this is tracked server-side via pending_consent.py
+        instead of a signed state token. See that module's docstring for the
+        current single-flight limitation."""
+        user_id = _authenticate(authorization)
+        ctrader_pending_consent.set_pending_user(user_id)
+        try:
+            url = ctrader_oauth.build_authorization_url()
+        except ctrader_oauth.OAuthError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"authorization_url": url}
+
+    @app.get("/accounts/ctrader/callback")
+    def ctrader_callback(code: str):
+        """
+        Hit by the user's BROWSER as a top-level navigation (Spotware redirects
+        here after consent) - not by the frontend via fetch, so there's no
+        Authorization header to check, and no `state` param either (see
+        ctrader_start above). Always resolves to a redirect back into the
+        frontend, success or failure, so the SPA can resume - see
+        _app.onboarding.tsx's ctrader_status search param.
+        """
+        # FRONTEND_URL should be the bare origin (e.g. https://copydesk1.netlify.app),
+        # no path - this handler appends /onboarding itself.
+        frontend_url = os.environ.get("FRONTEND_URL", "").rstrip("/")
+
+        def _redirect(**params: str) -> RedirectResponse:
+            return RedirectResponse(url=f"{frontend_url}/onboarding?{urlencode(params)}")
+
+        user_id = ctrader_pending_consent.consume_pending_user()
+        if user_id is None:
+            return _redirect(
+                ctrader_status="error",
+                message="This cTrader connection attempt expired or wasn't recognized - please try connecting again.",
+            )
+
+        try:
+            account_id = provision_ctrader_account(
+                user_id=user_id, authorization_code=code, fanout=fanout,
+                supabase_client=supabase_client, account_user_map=account_user_map, agents=agents,
+            )
+        except CTraderProvisioningError as exc:
+            logger.exception("cTrader provisioning failed for user %s", user_id)
+            return _redirect(ctrader_status="error", message=str(exc))
+
+        return _redirect(ctrader_status="success", account_id=account_id)
 
     @app.post("/accounts/{account_id}/pause")
     def pause(account_id: str, body: PauseRequest, authorization: str | None = Header(default=None)):

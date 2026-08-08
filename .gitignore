@@ -1,5 +1,6 @@
 myenv/
 copydesk_fanout/__pycache__/
+copydesk_fanout/README.md
 copydesk_fanout/*.env
 MetaTrader 5 IC Markets Global/
 MetaTrader 5/

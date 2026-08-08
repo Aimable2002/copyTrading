@@ -16,6 +16,7 @@ import os
 
 from .infra.supabase_client import execute_with_retry, get_supabase_client
 from .provisioning.provisioning import ProvisioningError, read_provisioned_credentials, resolve_instance_dir
+from .ctrader.master_agent import CTraderMasterAgent
 
 import asyncio
 
@@ -111,6 +112,21 @@ def _run_supabase_mode(serve: bool) -> None:
     skipped_accounts: list[str] = []
     for account in accounts:
         account_user_map[account["account_id"]] = account["user_id"]
+
+        # cTrader master accounts have no local terminal instance at all - the
+        # "accounts" row for one has platform="ctrader" and no
+        # metatrader_dir_path (see ctrader/provisioning.py). Everything below
+        # this branch is MT5-instance-specific and doesn't apply to them.
+        if account.get("platform") == "ctrader":
+            agent = CTraderMasterAgent(
+                account_id=account["account_id"],
+                on_trade_event=fanout.handle_master_trade_event,
+                supabase_client=supabase,
+            )
+            fanout.register_master(agent)
+            agents.append(agent)
+            logger.info("Registered ctrader master: %s", account["account_id"])
+            continue
 
         stored_path = account["metatrader_dir_path"]
         instance_dir = resolve_instance_dir(stored_path)

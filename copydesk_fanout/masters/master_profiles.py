@@ -96,13 +96,13 @@ def list_public_masters(supabase_client: Any) -> list[dict]:
     live_response = execute_with_retry(
         lambda: (
             supabase_client.table("accounts")
-            .select("account_id")
+            .select("account_id, platform")
             .in_("account_id", account_ids)
             .eq("status", "live")
             .execute()
         )
     )
-    live_ids = {row["account_id"] for row in (live_response.data or [])}
+    live_rows = {row["account_id"]: row for row in (live_response.data or [])}
 
     return [
         {
@@ -110,9 +110,10 @@ def list_public_masters(supabase_client: Any) -> list[dict]:
             "display_name": p["display_name"],
             "bio": p["bio"],
             "rate_percent": _get_rate_or_none(p["master_account_id"], supabase_client),
+            "platform": live_rows[p["master_account_id"]].get("platform", "mt5"),
         }
         for p in profiles
-        if p["master_account_id"] in live_ids
+        if p["master_account_id"] in live_rows
     ]
 
 
@@ -136,12 +137,12 @@ def list_all_masters(supabase_client: Any) -> list[dict]:
     status_response = execute_with_retry(
         lambda: (
             supabase_client.table("accounts")
-            .select("account_id, status")
+            .select("account_id, status, platform")
             .in_("account_id", account_ids)
             .execute()
         )
     )
-    status_by_id = {row["account_id"]: row["status"] for row in (status_response.data or [])}
+    status_by_id = {row["account_id"]: row for row in (status_response.data or [])}
 
     return [
         {
@@ -149,8 +150,9 @@ def list_all_masters(supabase_client: Any) -> list[dict]:
             "display_name": p["display_name"],
             "bio": p["bio"],
             "is_public": p["is_public"],
-            "account_status": status_by_id.get(p["master_account_id"], "unknown"),
+            "account_status": status_by_id.get(p["master_account_id"], {}).get("status", "unknown"),
             "rate_percent": _get_rate_or_none(p["master_account_id"], supabase_client),
+            "platform": status_by_id.get(p["master_account_id"], {}).get("platform", "mt5"),
         }
         for p in profiles
     ]

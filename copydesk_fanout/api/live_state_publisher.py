@@ -16,9 +16,9 @@ logger = logging.getLogger("live_state_publisher")
 DEFAULT_INTERVAL_SECONDS = 0.01 
 
 
-def _serialize_open_positions(agent: BaseAgent) -> list[dict[str, Any]]:
+def _serialize_open_positions(open_orders: dict) -> list[dict[str, Any]]:
     positions = []
-    for order_id, order in agent.terminal.open_orders.items():
+    for order_id, order in open_orders.items():
         positions.append(
             {
                 "ticket": order_id,
@@ -34,10 +34,22 @@ def _serialize_open_positions(agent: BaseAgent) -> list[dict[str, Any]]:
 
 
 def _build_state(agent: BaseAgent) -> dict[str, Any]:
+    # MT5 agents (TerminalAgent) hold a .terminal (Mt5Terminal) with
+    # .account_info/.open_orders. CTraderMasterAgent has no .terminal at all -
+    # it exposes .balance/.equity/.open_positions directly instead. Branching
+    # here keeps the MT5 path completely untouched rather than forcing a fake
+    # .terminal-shaped object onto CTraderMasterAgent just to satisfy this one
+    # caller.
+    if hasattr(agent, "terminal"):
+        return {
+            "balance": agent.terminal.account_info.get("balance"),
+            "equity": agent.terminal.account_info.get("equity"),
+            "open_positions": _serialize_open_positions(agent.terminal.open_orders),
+        }
     return {
-        "balance": agent.terminal.account_info.get("balance"),
-        "equity": agent.terminal.account_info.get("equity"),
-        "open_positions": _serialize_open_positions(agent),
+        "balance": agent.balance,
+        "equity": agent.equity,
+        "open_positions": _serialize_open_positions(agent.open_positions),
     }
 
 
