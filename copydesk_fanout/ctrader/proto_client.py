@@ -30,6 +30,7 @@ from typing import Callable
 from ctrader_open_api import Client, EndPoints, Protobuf, TcpProtocol
 from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAApplicationAuthReq,
+    ProtoOAErrorRes,
     ProtoOAExecutionEvent,
 )
 from twisted.internet import reactor
@@ -42,6 +43,23 @@ _APP_AUTH_TIMEOUT_SECONDS = 20.0
 
 class CTraderConnectionError(Exception):
     """Raised for any failure establishing or using the shared connection."""
+
+
+def raise_if_error(response, context: str) -> None:
+    """
+    send_and_wait() decodes whatever the API sends back, success or failure -
+    it does NOT raise just because the response is a ProtoOAErrorRes (e.g.
+    "account not authorized on this connection", sent after a reconnect that
+    hasn't been followed by a fresh ProtoOAAccountAuthReq yet). Every caller
+    that reads fields off a specific expected response type (.trader, .deal,
+    .symbol, .position, ...) MUST call this first, or an error response causes
+    a confusing AttributeError instead of a clear, actionable message.
+    """
+    if isinstance(response, ProtoOAErrorRes):
+        raise CTraderConnectionError(
+            f"{context}: cTrader Open API returned an error response "
+            f"(errorCode={response.errorCode!r}, description={response.description!r})"
+        )
 
 
 def _require_env(name: str) -> str:
@@ -69,6 +87,32 @@ class _SharedConnection:
         # ctidTraderAccountId (int) -> callback(message) for ProtoOAExecutionEvent
         # and anything else that carries that account id and needs live dispatch.
         self._execution_subscribers: dict[int, Callable] = {}
+        # Fired after every successful app-level auth EXCEPT the very first one,
+        # i.e. specifically on reconnect. App-level auth (ProtoOAApplicationAuthReq)
+        # only covers this one shared TCP connection - it says nothing about any
+        # individual trading account. Each previously-authed CTraderMasterAgent
+        # must redo its own ProtoOAAccountAuthReq after a reconnect, or every
+        # subsequent request for that account (ProtoOATraderReq, ProtoOADealListReq,
+        # ProtoOASymbolsListReq, ...) comes back as a ProtoOAErrorRes forever.
+        self._reconnect_subscribers: list[Callable[[], None]] = []
+        self._has_authed_once = False
+        # setMessageReceivedCallback (below, in ensure_started) fires _on_message
+        # ON THE REACTOR THREAD. Execution-event subscribers (CTraderMasterAgent
+        # ._on_message -> _translate_event -> ...) routinely need to make a
+        # blocking round-trip back into the API - e.g. symbol_map.SymbolCache
+        # lazily resolving a symbolId it hasn't seen yet via send_and_wait(). But
+        # send_and_wait() schedules its request with reactor.callFromThread() and
+        # then blocks the CALLING thread waiting for the reply; if the calling
+        # thread IS the reactor thread, that scheduled call can never run (the
+        # reactor is busy blocking on this very frame) and every such call
+        # deadlocks until it times out. So execution events are handed off to
+        # this dedicated worker thread - never invoked inline from _on_message -
+        # and processed in arrival order via a plain queue.
+        self._dispatch_queue: queue.Queue = queue.Queue()
+        self._dispatch_thread = threading.Thread(
+            target=self._dispatch_loop, name="ctrader-dispatch", daemon=True,
+        )
+        self._dispatch_thread.start()
 
     # -- lifecycle -------------------------------------------------------- #
 
@@ -120,7 +164,23 @@ class _SharedConnection:
     def _on_app_auth_success(self, _response) -> None:
         logger.info("cTrader Open API application authenticated")
         self._app_auth_error = None
+        is_reconnect = self._has_authed_once
+        self._has_authed_once = True
         self._app_authed.set()
+        if is_reconnect:
+            # Notify off the reactor thread: subscribers (CTraderMasterAgent's
+            # re-auth handler) call send_and_wait(), which would deadlock the
+            # reactor if run inline here.
+            threading.Thread(
+                target=self._notify_reconnect_subscribers, name="ctrader-reconnect-notify", daemon=True,
+            ).start()
+
+    def _notify_reconnect_subscribers(self) -> None:
+        for callback in list(self._reconnect_subscribers):
+            try:
+                callback()
+            except Exception:
+                logger.exception("Reconnect subscriber raised")
 
     def _on_app_auth_failure(self, failure) -> None:
         logger.error("cTrader Open API application auth failed: %s", failure)
@@ -145,8 +205,22 @@ class _SharedConnection:
 
         account_id = getattr(payload, "ctidTraderAccountId", None)
         if account_id is not None and account_id in self._execution_subscribers:
+            # Hand off to _dispatch_loop rather than calling the subscriber
+            # inline - see the comment on self._dispatch_queue in __init__ for
+            # why calling it directly here (on the reactor thread) deadlocks
+            # any subscriber code path that calls send_and_wait().
+            self._dispatch_queue.put((account_id, payload))
+
+    def _dispatch_loop(self) -> None:
+        while True:
+            account_id, payload = self._dispatch_queue.get()
+            callback = self._execution_subscribers.get(account_id)
+            if callback is None:
+                # Unsubscribed between enqueue and dispatch (e.g. agent.stop()) -
+                # nothing to deliver to.
+                continue
             try:
-                self._execution_subscribers[account_id](payload)
+                callback(payload)
             except Exception:
                 logger.exception("Execution subscriber for ctid %s raised", account_id)
 
@@ -157,6 +231,17 @@ class _SharedConnection:
 
     def unsubscribe(self, ctid_trader_account_id: int) -> None:
         self._execution_subscribers.pop(ctid_trader_account_id, None)
+
+    def on_reconnect(self, callback: Callable[[], None]) -> None:
+        """
+        Register `callback` to be invoked (on a background thread, never the
+        reactor thread) after every reconnect - i.e. every successful
+        ProtoOAApplicationAuthReq after the first. Used by CTraderMasterAgent
+        to redo its ProtoOAAccountAuthReq once the shared connection comes
+        back up. Not called for the initial connection - callers that need
+        the initial auth do it themselves in start().
+        """
+        self._reconnect_subscribers.append(callback)
 
     # -- request/response bridge ------------------------------------------ #
 

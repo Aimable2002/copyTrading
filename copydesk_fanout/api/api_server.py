@@ -51,6 +51,7 @@ from .socket_server import verify_supabase_jwt
 from ..billing.wallet import WalletError
 
 from .admin_routes import build_admin_router
+from .payments_routes import build_payments_router, build_webhooks_router
 
 logger = logging.getLogger("api_server")
 
@@ -159,6 +160,13 @@ def create_api_app(
     # from every existing route above so this addition can't change the
     # behavior of anything that was already working.
     app.include_router(build_admin_router(fanout=fanout, supabase_client=supabase_client))
+
+    # Own prefixes (/payments, /webhooks), same isolation reasoning as the
+    # admin router above. /webhooks has no bearer-token auth at all -
+    # Flutterwave calls it directly, so payments_routes.build_webhooks_router
+    # authenticates the request itself via the HMAC signature header instead.
+    app.include_router(build_payments_router(account_user_map=account_user_map, supabase_client=supabase_client))
+    app.include_router(build_webhooks_router(fanout=fanout, supabase_client=supabase_client))
 
     app.add_middleware(
         CORSMiddleware,

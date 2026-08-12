@@ -37,7 +37,7 @@ from dataclasses import dataclass
 
 from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOASymbolsListReq
 
-from .proto_client import get_connection
+from .proto_client import get_connection, raise_if_error
 
 logger = logging.getLogger("ctrader.symbol_map")
 
@@ -64,6 +64,7 @@ class SymbolCache:
         response = conn.send_and_wait(
             ProtoOASymbolsListReq(ctidTraderAccountId=self._ctid, includeArchivedSymbols=False)
         )
+        raise_if_error(response, f"[ctid {self._ctid}] load symbols")
         for light in response.symbol:
             # ProtoOASymbolsListRes only gives ProtoOALightSymbol (no lotSize) -
             # lotSize needs a per-symbol ProtoOASymbolByIdReq. To avoid N+1
@@ -99,6 +100,7 @@ class SymbolCache:
             precise = conn.send_and_wait(
                 ProtoOASymbolByIdReq(ctidTraderAccountId=self._ctid, symbolId=[symbol_id])
             )
+            raise_if_error(precise, f"[ctid {self._ctid}] load symbol {symbol_id} lot size")
             if precise.symbol:
                 info.lot_size_units = precise.symbol[0].lotSize / _VOLUME_SCALE
         return info.lot_size_units

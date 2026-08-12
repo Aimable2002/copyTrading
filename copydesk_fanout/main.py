@@ -132,7 +132,30 @@ def _run_supabase_mode(serve: bool) -> None:
             # ctidTraderAccountId still unset (None), causing an EncodeError.
             # start() is idempotent, so the later generic start() call is a
             # harmless no-op for this agent.
-            agent.start()
+            #
+            # start() can also raise CTraderConnectionError - bad
+            # CTRADER_CLIENT_ID/SECRET, or the shared connection failing to
+            # reach cTrader's host at all (network/firewall/DNS on this
+            # machine). Unlike the MT5 branch's ProvisioningError above, this
+            # was previously left uncaught: an unhandled exception here blew
+            # up main()'s whole account loop, which crashes the *entire*
+            # process and takes down every other account - MT5 masters,
+            # MT5 followers, and any other cTrader master that would have
+            # started fine - along with it. One flaky cTrader connection
+            # should not be able to take the whole service down; skip this
+            # account the same way the MT5 branch already skips accounts with
+            # missing instance data, and keep going.
+            try:
+                agent.start()
+            except Exception as exc:
+                logger.error(
+                    "Skipping ctrader master %s: failed to start (%s). This account will not "
+                    "be polled until this is resolved and the process is restarted.",
+                    account["account_id"], exc,
+                )
+                account_user_map.pop(account["account_id"], None)
+                skipped_accounts.append(account["account_id"])
+                continue
             fanout.register_master(agent)
             agents.append(agent)
             logger.info("Registered ctrader master: %s", account["account_id"])
