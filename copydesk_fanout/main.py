@@ -34,6 +34,14 @@ logger = logging.getLogger("main")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+# How often _skipped_ctrader_retry_sweep (in _run_agents_with_server) retries
+# starting a cTrader master account that failed at boot. Not too aggressive -
+# a persistently unreachable connection shouldn't be hammered - but frequent
+# enough that a transient blip (network/DNS hiccup, cTrader's own auth
+# server being briefly slow) self-heals within a couple minutes instead of
+# needing someone to notice and restart the whole process.
+_CTRADER_RETRY_SWEEP_INTERVAL_SECONDS = 60.0
+
 
 def _run_local_file_mode(config_path: Path) -> None:
     if not config_path.exists():
@@ -110,6 +118,13 @@ def _run_supabase_mode(serve: bool) -> None:
     agents: list[TerminalAgent] = []
     account_user_map: dict[str, str] = {}
     skipped_accounts: list[str] = []
+    # Accounts skipped below (agent.start() failed at boot) go here too, kept
+    # alongside their already-constructed agent so _skipped_ctrader_retry_sweep
+    # in _run_agents_with_server can retry agent.start() on the SAME agent
+    # object (safe - start() is idempotent, see master_agent.py) instead of
+    # leaving the account dead until someone notices and restarts the whole
+    # process. This list is mutated in place by that sweep as accounts recover.
+    pending_ctrader_retries: list[tuple[str, str, CTraderMasterAgent]] = []
     for account in accounts:
         account_user_map[account["account_id"]] = account["user_id"]
 
@@ -149,12 +164,13 @@ def _run_supabase_mode(serve: bool) -> None:
                 agent.start()
             except Exception as exc:
                 logger.error(
-                    "Skipping ctrader master %s: failed to start (%s). This account will not "
-                    "be polled until this is resolved and the process is restarted.",
-                    account["account_id"], exc,
+                    "Skipping ctrader master %s: failed to start (%s). Will retry in the "
+                    "background every %ds until it comes up - see _skipped_ctrader_retry_sweep.",
+                    account["account_id"], exc, _CTRADER_RETRY_SWEEP_INTERVAL_SECONDS,
                 )
                 account_user_map.pop(account["account_id"], None)
                 skipped_accounts.append(account["account_id"])
+                pending_ctrader_retries.append((account["account_id"], account["user_id"], agent))
                 continue
             fanout.register_master(agent)
             agents.append(agent)
@@ -214,15 +230,25 @@ def _run_supabase_mode(serve: bool) -> None:
 
     if skipped_accounts:
         logger.warning(
-            "Started up with %d account(s) skipped due to missing instance data: %s",
+            "Started up with %d account(s) skipped due to startup failures (missing instance "
+            "data, or a cTrader connection that didn't come up in time): %s. cTrader accounts "
+            "among these retry automatically in the background - see "
+            "_skipped_ctrader_retry_sweep; others need a manual restart once fixed.",
             len(skipped_accounts), ", ".join(skipped_accounts),
         )
 
     fanout.reconcile_all()
 
     if serve:
-        _run_agents_with_server(agents, fanout, supabase, account_user_map, pair_store)
+        _run_agents_with_server(agents, fanout, supabase, account_user_map, pair_store, pending_ctrader_retries)
     else:
+        if pending_ctrader_retries:
+            logger.warning(
+                "%d skipped ctrader account(s) will NOT be retried in this mode (--no-serve has "
+                "no background task loop to run _skipped_ctrader_retry_sweep in) - restart to "
+                "pick them up once fixed.",
+                len(pending_ctrader_retries),
+            )
         _run_agents(agents)
 
 
@@ -232,7 +258,9 @@ def _run_agents_with_server(
     supabase,
     account_user_map: dict[str, str],
     pair_store: OrderPairStore,
+    pending_ctrader_retries: list[tuple[str, str, CTraderMasterAgent]] | None = None,
 ) -> None:
+    pending_ctrader_retries = pending_ctrader_retries if pending_ctrader_retries is not None else []
 
     for agent in agents:
         agent.start()
@@ -279,6 +307,35 @@ def _run_agents_with_server(
             except Exception:
                 logger.exception("Weekly-charge sweep cycle failed - will retry next interval")
 
+    async def _skipped_ctrader_retry_sweep(interval_seconds: float = _CTRADER_RETRY_SWEEP_INTERVAL_SECONDS) -> None:
+        """Self-heals accounts skipped in _run_supabase_mode's startup loop
+        (agent.start() failed - see that block's comment for why skipping,
+        not crashing the whole process, is the right immediate response).
+        Skipping alone just leaves the account permanently broken until
+        someone notices and restarts, though - this is the other half:
+        periodically retry each skipped agent's start() (idempotent, safe to
+        call again - see master_agent.py) and, the moment one succeeds,
+        register it into fanout/agents/account_user_map exactly like a
+        normal successful startup would have, with no restart needed."""
+        loop = asyncio.get_event_loop()
+        while True:
+            await asyncio.sleep(interval_seconds)
+            if not pending_ctrader_retries:
+                continue
+            still_pending: list[tuple[str, str, CTraderMasterAgent]] = []
+            for account_id, user_id, agent in pending_ctrader_retries:
+                try:
+                    await loop.run_in_executor(None, agent.start)
+                except Exception as exc:
+                    logger.info("Retry failed for skipped ctrader master %s: %s", account_id, exc)
+                    still_pending.append((account_id, user_id, agent))
+                    continue
+                fanout.register_master(agent)
+                agents.append(agent)
+                account_user_map[account_id] = user_id
+                logger.info("Recovered previously-skipped ctrader master %s - back online", account_id)
+            pending_ctrader_retries[:] = still_pending
+
     def _log_background_task_result(name: str, task: "asyncio.Task") -> None:
         if task.cancelled():
             return
@@ -304,6 +361,7 @@ def _run_agents_with_server(
             "close_retry_sweep": asyncio.create_task(_close_retry_sweep()),
             "billing_grace_sweep": asyncio.create_task(_billing_grace_sweep()),
             "weekly_charge_sweep": asyncio.create_task(_weekly_charge_sweep()),
+            "skipped_ctrader_retry_sweep": asyncio.create_task(_skipped_ctrader_retry_sweep()),
         }
         for name, task in background.items():
             task.add_done_callback(lambda t, name=name: _log_background_task_result(name, t))
