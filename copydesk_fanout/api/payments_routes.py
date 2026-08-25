@@ -21,9 +21,10 @@ class QuoteRequest(BaseModel):
 
 class CheckoutRequest(BaseModel):
     account_id: str
-    purpose: Literal["wallet_topup", "package"]
+    purpose: Literal["wallet_topup", "package", "challenge_entry"]
     amount_usd: float | None = None
     package_code: str | None = None
+    challenge_id: str | None = None
     currency: str
     method: Literal["card", "mobilemoney", "banktransfer"]
     phone_number: str | None = None
@@ -74,6 +75,7 @@ def build_payments_router(*, account_user_map: dict[str, str], supabase_client: 
                 purpose=body.purpose,
                 amount_usd=body.amount_usd,
                 package_code=body.package_code,
+                challenge_id=body.challenge_id,
                 currency=body.currency,
                 method=body.method,
                 phone_number=body.phone_number,

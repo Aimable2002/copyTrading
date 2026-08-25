@@ -22,10 +22,14 @@ _HEALTHY_CONNECTION_SECONDS = 60.0
 @dataclass
 class FollowerSubscription:
     follower_account_id: str
-    multiplier: float
     sizing_mode: SizingMode
-    fixed_master_balance: float | None = None
+    sizing_value: float | None = None
     active: bool = True
+    # Legacy fields from the retired fixed_multiplier / balance_proportional /
+    # fixed_master_balance_percentage sizing modes. Kept, not deleted, for any
+    # historical subscriptions rows; no longer read by calculate_follower_volume().
+    # multiplier: float = 1.0
+    # fixed_master_balance: float | None = None
 
 
 class ConfigStore:
@@ -47,9 +51,8 @@ class ConfigStore:
             followers = [
                 FollowerSubscription(
                     follower_account_id=f["follower_account_id"],
-                    multiplier=f["multiplier"],
                     sizing_mode=f["sizing_mode"],
-                    fixed_master_balance=f.get("fixed_master_balance"),
+                    sizing_value=f.get("sizing_value"),
                     active=f.get("active", True),
                 )
                 for f in followers_raw
@@ -63,9 +66,8 @@ class ConfigStore:
     def _row_to_subscription(row: dict[str, Any]) -> FollowerSubscription:
         return FollowerSubscription(
             follower_account_id=row["follower_account_id"],
-            multiplier=row["multiplier"],
             sizing_mode=row["sizing_mode"],
-            fixed_master_balance=row.get("fixed_master_balance"),
+            sizing_value=row.get("sizing_value"),
             active=row.get("active", True),
         )
 
@@ -159,3 +161,4 @@ class ConfigStore:
         logger.info("Realtime config sync: subscribed to subscriptions table changes")
 
         await asyncio.Event().wait()
+        

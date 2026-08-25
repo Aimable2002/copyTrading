@@ -73,6 +73,11 @@ def position_to_order_dict(pos: Any) -> dict:
         "open_price": pos.price_open,
         "magic": pos.magic,
         "comment": pos.comment,
+        # Both already available on the MT5 position object - just weren't
+        # being read before. Needed for the frontend's open-positions widget
+        # (live pnl / current price per position).
+        "current_price": pos.price_current,
+        "pnl": pos.profit,
     }
 
 
@@ -560,6 +565,10 @@ class Mt5Terminal:
     @property
     def balance(self) -> float | None:
         return self.account_info.get("balance")
+
+    @property
+    def equity(self) -> float | None:
+        return self.account_info.get("equity")
 
     @property
     def historic_trades(self) -> dict:

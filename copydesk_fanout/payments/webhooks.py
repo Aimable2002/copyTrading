@@ -23,10 +23,33 @@ import os
 from typing import Any
 
 from ..billing import billing, payouts, wallet
+from ..infra.supabase_client import execute_with_retry
+from ..masters import challenges
 from . import intents
 from .flutterwave_client import FlutterwaveError, flutterwave
 
 logger = logging.getLogger("payments.webhooks")
+
+
+def _resolve_current_equity(account_id: str, fanout: Any, supabase_client: Any) -> float | None:
+    """Prefers the live, running agent (most current); falls back to the
+    last known live_account_state row if the agent isn't connected right
+    at this instant (e.g. a brief reconnect window) - a slightly stale
+    equity snapshot is still far better than failing the enrollment
+    outright after the master has already paid."""
+    agent = fanout.master_agents.get(account_id) if fanout is not None else None
+    if agent is not None and agent.is_connected:
+        equity = agent.equity
+        if equity is not None:
+            return float(equity)
+
+    response = execute_with_retry(
+        lambda: supabase_client.table("live_account_state").select("equity").eq("account_id", account_id).execute()
+    )
+    rows = response.data or []
+    if rows and rows[0].get("equity") is not None:
+        return float(rows[0]["equity"])
+    return None
 
 
 def valid_signature(raw_body: bytes, signature: str) -> bool:
@@ -109,6 +132,39 @@ def _handle_charge_completed(data: dict, fanout: Any, supabase_client: Any) -> N
 
     account_id = intent["account_id"]
     try:
+        if intent["purpose"] == "challenge_entry" and intent.get("challenge_id"):
+            # Deliberately NOT a wallet top-up - the entry fee is the
+            # platform's revenue for this attempt, not the master's money to
+            # spend. starting_equity is resolved fresh right here (not
+            # carried from checkout time) since some time may have passed
+            # between initiating checkout and Flutterwave confirming payment.
+            starting_equity = _resolve_current_equity(account_id, fanout, supabase_client)
+            if starting_equity is None:
+                logger.error(
+                    "Could not resolve equity for master %s to enroll after confirmed challenge payment %s - "
+                    "payment succeeded but enrollment is blocked, needs manual review",
+                    account_id, reference,
+                )
+                # Deliberately don't finalize as failed - see the module
+                # docstring: the payment DID succeed, this needs a human,
+                # not a silent loss of a real payment.
+                return
+            try:
+                challenges.enroll(
+                    master_account_id=account_id, challenge_id=intent["challenge_id"],
+                    starting_equity=starting_equity, supabase_client=supabase_client,
+                )
+            except challenges.ChallengeError:
+                logger.exception(
+                    "Enrollment failed for %s after confirmed challenge payment %s - "
+                    "payment succeeded but enrollment was rejected (already enrolled elsewhere? "
+                    "challenge deactivated between checkout and confirmation?), needs manual review",
+                    account_id, reference,
+                )
+                return
+            intents.finalize_intent(reference, "successful", supabase_client, credited=True)
+            return
+
         wallet.top_up(account_id, float(intent["amount_usd"]), supabase_client)
         if intent["purpose"] == "package" and intent.get("package_code"):
             # Best-effort: the wallet credit above already succeeded (money

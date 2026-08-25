@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Any
 
+from . import copy_events
 from .config_store import ConfigStore
 from .follower_agent import FollowerAgent
 from .mt5_terminal import OrderCapExceeded
@@ -23,9 +25,13 @@ _INLINE_CLOSE_RETRY_DELAY_SECONDS = 0.2
 
 class FanoutCore:
 
-    def __init__(self, config_store: ConfigStore, pair_store: OrderPairStore):
+    def __init__(self, config_store: ConfigStore, pair_store: OrderPairStore, supabase_client: Any | None = None):
         self.config_store = config_store
         self.pair_store = pair_store
+        # Optional - None in local-file/no-DB mode. Used only for the
+        # copy_events audit log (see core/copy_events.py); never required
+        # for a copy to succeed.
+        self.supabase_client = supabase_client
         self.master_agents: dict[str, TerminalAgent] = {}
         self.follower_agents: dict[str, FollowerAgent] = {}
         # (master_account_id, master_ticket) -> set of follower_account_id
@@ -87,6 +93,15 @@ class FanoutCore:
             self._fan_out_pending_cancel(master_account_id, ticket)
 
     def _fan_out_open(self, master_account_id: str, master_ticket: str, master_order: dict) -> None:
+        # Marks the moment our system started processing this master fill -
+        # the honest origin point for a "relay latency" metric. Not the
+        # master's broker-side execution timestamp (we don't control clock
+        # sync across different brokers' servers), but the time between us
+        # detecting the fill and confirming each follower's copy - i.e. our
+        # own pipeline's dispatch speed, which is what "relay latency"
+        # actually means for this platform. See copy_events.record_success().
+        dispatch_started_at = time.time()
+
         master_agent = self.master_agents.get(master_account_id)
         if master_agent is None:
             logger.warning("Trade event for unknown master account %s", master_account_id)
@@ -104,22 +119,34 @@ class FanoutCore:
             follower_agent = self.follower_agents.get(sub.follower_account_id)
             if follower_agent is None:
                 logger.warning("Subscribed follower %s has no registered agent", sub.follower_account_id)
+                copy_events.record_failure(
+                    master_account_id=master_account_id, follower_account_id=sub.follower_account_id,
+                    master_ticket=master_ticket, reason="no_registered_agent", supabase_client=self.supabase_client,
+                )
                 continue
             if not follower_agent.is_connected:
                 logger.warning("Follower %s not connected yet, skipping this fill", sub.follower_account_id)
+                copy_events.record_failure(
+                    master_account_id=master_account_id, follower_account_id=sub.follower_account_id,
+                    master_ticket=master_ticket, reason="not_connected", supabase_client=self.supabase_client,
+                )
                 continue
 
             try:
                 lots = calculate_follower_volume(
                     mode=sub.sizing_mode,
                     master_lots=master_lots,
-                    multiplier=sub.multiplier,
                     master_balance=master_balance,
                     follower_balance=follower_agent.balance,
-                    fixed_master_balance=sub.fixed_master_balance,
+                    follower_equity=follower_agent.equity,
+                    sizing_value=sub.sizing_value,
                 )
-            except ValueError:
+            except ValueError as exc:
                 logger.exception("Sizing failed for follower %s, skipping", sub.follower_account_id)
+                copy_events.record_failure(
+                    master_account_id=master_account_id, follower_account_id=sub.follower_account_id,
+                    master_ticket=master_ticket, reason=f"sizing_failed: {exc}", supabase_client=self.supabase_client,
+                )
                 continue
 
             self.pair_store.add_pending(master_account_id, master_ticket, sub.follower_account_id, dispatched_lots=lots)
@@ -137,6 +164,10 @@ class FanoutCore:
                     "Follower %s hit its order cap - skipping this copy, other followers unaffected",
                     sub.follower_account_id,
                 )
+                copy_events.record_failure(
+                    master_account_id=master_account_id, follower_account_id=sub.follower_account_id,
+                    master_ticket=master_ticket, reason="order_cap_exceeded", supabase_client=self.supabase_client,
+                )
                 continue
 
             if not result.get("success"):
@@ -145,11 +176,22 @@ class FanoutCore:
                     sub.follower_account_id, result.get("retcode"), result.get("comment"),
                 )
                 print(" logging the entire results of order attempted :", result)
+                copy_events.record_failure(
+                    master_account_id=master_account_id, follower_account_id=sub.follower_account_id,
+                    master_ticket=master_ticket,
+                    reason=f"order_rejected: retcode={result.get('retcode')} comment={result.get('comment')}",
+                    supabase_client=self.supabase_client,
+                )
                 continue
 
             logger.info(
                 "Dispatched copy: master %s#%s -> follower %s, %.2f lots",
                 master_account_id, master_ticket, sub.follower_account_id, lots,
+            )
+            copy_events.record_success(
+                master_account_id=master_account_id, follower_account_id=sub.follower_account_id,
+                master_ticket=master_ticket, lots=lots, supabase_client=self.supabase_client,
+                latency_ms=(time.time() - dispatch_started_at) * 1000,
             )
 
     def _fan_out_pending_open(self, master_account_id: str, master_ticket: str, master_order: dict) -> None:
@@ -177,9 +219,9 @@ class FanoutCore:
 
             try:
                 lots = calculate_follower_volume(
-                    mode=sub.sizing_mode, master_lots=master_lots, multiplier=sub.multiplier,
+                    mode=sub.sizing_mode, master_lots=master_lots,
                     master_balance=master_balance, follower_balance=follower_agent.balance,
-                    fixed_master_balance=sub.fixed_master_balance,
+                    follower_equity=follower_agent.equity, sizing_value=sub.sizing_value,
                 )
             except ValueError:
                 logger.exception("Sizing failed for follower %s, skipping", sub.follower_account_id)

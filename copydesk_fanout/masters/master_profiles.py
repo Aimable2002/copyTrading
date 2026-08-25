@@ -4,7 +4,10 @@ import logging
 from typing import Any
 
 from ..infra.supabase_client import execute_with_retry
-from ..billing.master_rate import get_public_rate
+
+# Performance-fee rate feature disabled - platform is subscription-only now.
+# Kept the import commented rather than removed in case this is revisited.
+# from ..billing.master_rate import get_public_rate
 
 logger = logging.getLogger("master_profiles")
 
@@ -14,7 +17,8 @@ class MasterProfileError(Exception):
 
 
 def upsert_profile(
-    *, account_id: str, user_id: str, display_name: str, bio: str, supabase_client: Any,
+    *, account_id: str, user_id: str, display_name: str, bio: str, country: str | None = None,
+    supabase_client: Any,
 ) -> dict:
     if not display_name.strip():
         raise MasterProfileError("display_name cannot be empty")
@@ -25,6 +29,7 @@ def upsert_profile(
         "user_id": user_id,
         "display_name": display_name.strip(),
         "bio": bio.strip(),
+        "country": country,
     }
     if existing is None:
         payload["is_public"] = False 
@@ -35,7 +40,7 @@ def upsert_profile(
 
     is_public = existing["is_public"] if existing is not None else False
     logger.info("Upserted master profile for %s (is_public unchanged at %s)", account_id, is_public)
-    return {"account_id": account_id, "display_name": display_name, "is_public": is_public}
+    return {"account_id": account_id, "display_name": display_name, "country": country, "is_public": is_public}
 
 
 def set_public_status(account_id: str, is_public: bool, supabase_client: Any) -> None:
@@ -49,7 +54,7 @@ def get_own_profile(account_id: str, supabase_client: Any) -> dict | None:
     response = execute_with_retry(
         lambda: (
             supabase_client.table("master_profiles")
-            .select("master_account_id, display_name, bio, is_public")
+            .select("master_account_id, display_name, bio, country, is_public")
             .eq("master_account_id", account_id)
             .execute()
         )
@@ -62,6 +67,7 @@ def get_own_profile(account_id: str, supabase_client: Any) -> dict | None:
         "account_id": row["master_account_id"],
         "display_name": row["display_name"],
         "bio": row.get("bio"),
+        "country": row.get("country"),
         "is_public": row["is_public"],
     }
 
@@ -83,7 +89,7 @@ def list_public_masters(supabase_client: Any) -> list[dict]:
     profiles_response = execute_with_retry(
         lambda: (
             supabase_client.table("master_profiles")
-            .select("master_account_id, display_name, bio")
+            .select("master_account_id, display_name, bio, country")
             .eq("is_public", True)
             .execute()
         )
@@ -96,7 +102,7 @@ def list_public_masters(supabase_client: Any) -> list[dict]:
     live_response = execute_with_retry(
         lambda: (
             supabase_client.table("accounts")
-            .select("account_id, platform")
+            .select("account_id, platform, broker")
             .in_("account_id", account_ids)
             .eq("status", "live")
             .execute()
@@ -109,8 +115,14 @@ def list_public_masters(supabase_client: Any) -> list[dict]:
             "account_id": p["master_account_id"],
             "display_name": p["display_name"],
             "bio": p["bio"],
-            "rate_percent": _get_rate_or_none(p["master_account_id"], supabase_client),
+            "country": p.get("country"),
+            # Performance-fee rate feature disabled - platform is
+            # subscription-only now. rate_percent intentionally omitted
+            # rather than always-None, so it's clearly gone from the
+            # contract instead of looking like a master who never set one.
+            # "rate_percent": _get_rate_or_none(p["master_account_id"], supabase_client),
             "platform": live_rows[p["master_account_id"]].get("platform", "mt5"),
+            "broker": live_rows[p["master_account_id"]].get("broker"),
         }
         for p in profiles
         if p["master_account_id"] in live_rows
@@ -125,7 +137,7 @@ def list_all_masters(supabase_client: Any) -> list[dict]:
     profiles_response = execute_with_retry(
         lambda: (
             supabase_client.table("master_profiles")
-            .select("master_account_id, display_name, bio, is_public")
+            .select("master_account_id, display_name, bio, country, is_public")
             .execute()
         )
     )
@@ -137,7 +149,7 @@ def list_all_masters(supabase_client: Any) -> list[dict]:
     status_response = execute_with_retry(
         lambda: (
             supabase_client.table("accounts")
-            .select("account_id, status, platform")
+            .select("account_id, status, platform, broker")
             .in_("account_id", account_ids)
             .execute()
         )
@@ -149,15 +161,18 @@ def list_all_masters(supabase_client: Any) -> list[dict]:
             "account_id": p["master_account_id"],
             "display_name": p["display_name"],
             "bio": p["bio"],
+            "country": p.get("country"),
             "is_public": p["is_public"],
             "account_status": status_by_id.get(p["master_account_id"], {}).get("status", "unknown"),
-            "rate_percent": _get_rate_or_none(p["master_account_id"], supabase_client),
+            # "rate_percent": _get_rate_or_none(p["master_account_id"], supabase_client),  # disabled, see above
             "platform": status_by_id.get(p["master_account_id"], {}).get("platform", "mt5"),
+            "broker": status_by_id.get(p["master_account_id"], {}).get("broker"),
         }
         for p in profiles
     ]
 
 
-def _get_rate_or_none(master_account_id: str, supabase_client: Any) -> float | None:
-    rate = get_public_rate(master_account_id, supabase_client)
-    return rate["rate_percent"] if rate else None
+# def _get_rate_or_none(master_account_id: str, supabase_client: Any) -> float | None:
+#     # Performance-fee rate feature disabled - platform is subscription-only now.
+#     rate = get_public_rate(master_account_id, supabase_client)
+#     return rate["rate_percent"] if rate else None

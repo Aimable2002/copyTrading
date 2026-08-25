@@ -10,6 +10,7 @@ import uuid
 from typing import Any
 
 from ..billing.billing import BillingError, get_package
+from ..masters.challenges import ChallengeError, assert_can_enroll
 from . import currencies, intents
 from .currencies import CurrencyError
 from .flutterwave_client import FlutterwaveError, flutterwave
@@ -27,11 +28,12 @@ class CheckoutError(Exception):
 
 
 def _resolve_amount_usd(*, purpose: str, amount_usd: float | None, package_code: str | None,
-                         supabase_client: Any) -> tuple[float, str | None]:
+                         challenge_id: str | None, account_id: str, supabase_client: Any,
+                         ) -> tuple[float, str | None, str | None]:
     if purpose == "wallet_topup":
         if not amount_usd or amount_usd <= 0:
             raise CheckoutError("amount_usd must be a positive number for wallet_topup")
-        return amount_usd, None
+        return amount_usd, None, None
 
     if purpose == "package":
         if not package_code:
@@ -43,7 +45,19 @@ def _resolve_amount_usd(*, purpose: str, amount_usd: float | None, package_code:
         # infra_fee is the package's USD price - see billing.py's get_package
         # docstring: pricing lives in Supabase, this is the one source of
         # truth the frontend's pricing page also reads directly.
-        return float(package["infra_fee"]), package_code
+        return float(package["infra_fee"]), package_code, None
+
+    if purpose == "challenge_entry":
+        if not challenge_id:
+            raise CheckoutError("challenge_id is required for purpose=challenge_entry")
+        # Pre-checks the fee, the active flag, the already-enrolled guard, and
+        # the challenge-1 gate BEFORE ever taking payment - no point charging
+        # someone for an enrollment that was always going to be rejected.
+        try:
+            challenge = assert_can_enroll(account_id, challenge_id, supabase_client)
+        except ChallengeError as exc:
+            raise CheckoutError(str(exc)) from exc
+        return float(challenge["fee"]), None, challenge_id
 
     raise CheckoutError(f"Unknown purpose {purpose!r}")
 
@@ -103,11 +117,12 @@ def _build_payment_method(*, method: str, currency: str, phone_number: str | Non
 
 def initiate_checkout(
     *, account_id: str, user_id: str, purpose: str, amount_usd: float | None, package_code: str | None,
-    currency: str, method: str, phone_number: str | None, network: str | None, redirect_url: str,
-    supabase_client: Any,
+    challenge_id: str | None, currency: str, method: str, phone_number: str | None, network: str | None,
+    redirect_url: str, supabase_client: Any,
 ) -> dict:
-    resolved_amount_usd, resolved_package_code = _resolve_amount_usd(
-        purpose=purpose, amount_usd=amount_usd, package_code=package_code, supabase_client=supabase_client,
+    resolved_amount_usd, resolved_package_code, resolved_challenge_id = _resolve_amount_usd(
+        purpose=purpose, amount_usd=amount_usd, package_code=package_code, challenge_id=challenge_id,
+        account_id=account_id, supabase_client=supabase_client,
     )
 
     try:
@@ -122,8 +137,8 @@ def initiate_checkout(
     reference = f"pay{uuid.uuid4().hex}"
     intents.record_intent(
         reference=reference, account_id=account_id, user_id=user_id, purpose=purpose,
-        package_code=resolved_package_code, amount_usd=resolved_amount_usd, currency=currency,
-        amount_charged=quote["amount_charged"], method=method, supabase_client=supabase_client,
+        package_code=resolved_package_code, challenge_id=resolved_challenge_id, amount_usd=resolved_amount_usd,
+        currency=currency, amount_charged=quote["amount_charged"], method=method, supabase_client=supabase_client,
     )
 
     try:

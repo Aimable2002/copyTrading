@@ -84,7 +84,9 @@ def build_admin_router(*, fanout: Any, supabase_client: Any) -> APIRouter:
         if profile is None:
             raise HTTPException(status_code=404, detail=f"No master profile for {account_id}")
 
-        rate = master_rate.get_current_rate(account_id, supabase_client)
+        # Performance-fee rate feature disabled - platform is
+        # subscription-only now. Kept commented rather than deleted.
+        # rate = master_rate.get_current_rate(account_id, supabase_client)
         earnings = profit_share.get_master_earnings(account_id, supabase_client)
         follower_count = roster.count_active_followers(account_id, supabase_client)
 
@@ -93,7 +95,6 @@ def build_admin_router(*, fanout: Any, supabase_client: Any) -> APIRouter:
 
         return {
             **profile,
-            "rate": rate,
             "earnings": earnings,
             "follower_count": follower_count,
             "trades": trades,
@@ -147,7 +148,7 @@ def build_admin_router(*, fanout: Any, supabase_client: Any) -> APIRouter:
     @router.get("/analytics/top-masters")
     def top_masters(authorization: str | None = Header(default=None)):
         _authenticate_admin(authorization)
-        return admin_analytics.get_top_masters(supabase_client)
+        return admin_analytics.get_top_masters(supabase_client, fanout)
 
     @router.get("/users")
     def users(authorization: str | None = Header(default=None)):

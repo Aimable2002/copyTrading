@@ -329,8 +329,9 @@ def finalize_provisioned_account(
     account_user_map: dict[str, str],
     agents: list[TerminalAgent],
     master_account_id: str | None = None,
-    multiplier: float | None = None,
+    sizing_value: float | None = None,
     sizing_mode: str | None = None,
+    broker: str | None = None,
 ) -> None:
     if role == "master":
         fanout.register_master(agent)
@@ -347,6 +348,7 @@ def finalize_provisioned_account(
                 "role": role,
                 "metatrader_dir_path": _legacy_display_path(Path(terminal_path).parent),
                 "status": "live",
+                "broker": broker,
             }
         ).execute()
     )
@@ -357,7 +359,7 @@ def finalize_provisioned_account(
                 {
                     "master_account_id": master_account_id,
                     "follower_account_id": account_id,
-                    "multiplier": multiplier,
+                    "sizing_value": sizing_value,
                     "sizing_mode": sizing_mode,
                     "active": True,
                 }
@@ -379,12 +381,13 @@ def provision_account(
     account_user_map: dict[str, str],
     agents: list[TerminalAgent],
     master_account_id: str | None = None,
-    multiplier: float | None = None,
+    sizing_value: float | None = None,
     sizing_mode: str | None = None,
+    broker: str | None = None,
     account_id: str | None = None,
 ) -> str:
-    if role == "follower" and (master_account_id is None or multiplier is None or sizing_mode is None):
-        raise ProvisioningError("follower provisioning requires master_account_id, multiplier, sizing_mode")
+    if role == "follower" and (master_account_id is None or sizing_value is None or sizing_mode is None):
+        raise ProvisioningError("follower provisioning requires master_account_id, sizing_value, sizing_mode")
 
     account_id = account_id or generate_account_id(role)
     agent, instance_dir, terminal_path = _start_terminal_and_agent(
@@ -405,7 +408,7 @@ def provision_account(
         agent, terminal_path,
         user_id=user_id, role=role, account_id=account_id,
         fanout=fanout, supabase_client=supabase_client, account_user_map=account_user_map, agents=agents,
-        master_account_id=master_account_id, multiplier=multiplier, sizing_mode=sizing_mode,
+        master_account_id=master_account_id, sizing_value=sizing_value, sizing_mode=sizing_mode, broker=broker,
     )
     return account_id
 
@@ -420,12 +423,12 @@ def provision_account_start(
     fanout: FanoutCore,
     supabase_client: Any,
     master_account_id: str | None = None,
-    multiplier: float | None = None,
+    sizing_value: float | None = None,
     sizing_mode: str | None = None,
     account_id: str | None = None,
 ) -> tuple[TerminalAgent, Path, str, ConnectOutcome, str]:
-    if role == "follower" and (master_account_id is None or multiplier is None or sizing_mode is None):
-        raise ProvisioningError("follower provisioning requires master_account_id, multiplier, sizing_mode")
+    if role == "follower" and (master_account_id is None or sizing_value is None or sizing_mode is None):
+        raise ProvisioningError("follower provisioning requires master_account_id, sizing_value, sizing_mode")
 
     account_id = account_id or generate_account_id(role)
     agent, instance_dir, terminal_path = _start_terminal_and_agent(
@@ -449,8 +452,9 @@ def provision_account_finish(
     account_user_map: dict[str, str],
     agents: list[TerminalAgent],
     master_account_id: str | None = None,
-    multiplier: float | None = None,
+    sizing_value: float | None = None,
     sizing_mode: str | None = None,
+    broker: str | None = None,
 ) -> None:
     try:
         _wait_stalled(agent)
@@ -463,5 +467,5 @@ def provision_account_finish(
         agent, terminal_path,
         user_id=user_id, role=role, account_id=account_id,
         fanout=fanout, supabase_client=supabase_client, account_user_map=account_user_map, agents=agents,
-        master_account_id=master_account_id, multiplier=multiplier, sizing_mode=sizing_mode,
+        master_account_id=master_account_id, sizing_value=sizing_value, sizing_mode=sizing_mode, broker=broker,
     )

@@ -8,6 +8,7 @@ from typing import Any
 # from . import master_profiles, master_rate, profit_share, roster
 from ..masters import master_profiles, roster
 from ..billing import master_rate, profit_share
+from ..core import trade_history
 from ..infra.supabase_client import execute_with_retry
 
 logger = logging.getLogger("admin_analytics")
@@ -29,6 +30,67 @@ def _last_n_months(n: int) -> list[str]:
         months.append(cursor.strftime("%Y-%m"))
         cursor = (cursor - timedelta(days=1)).replace(day=1)
     return list(reversed(months))
+
+
+def get_copy_stats(supabase_client: Any) -> dict:
+    """Backs PLATFORM_STATS.copiedToday, the admin 'Failed copies (24h)'
+    KPI, and the platform-wide average relay latency, all sourced from the
+    copy_events table written by core/copy_events.py at the moment each
+    master fill is (or isn't) successfully copied to a follower.
+    copied_today counts successes since local midnight UTC; failed_copies_24h/pct
+    look at a trailing 24h window instead of calendar-day, since "recent
+    failure rate" is the useful admin signal, not "failures since midnight".
+    avg_relay_latency_seconds_30d is the average of latency_ms across
+    successful copies in the trailing 30 days - see fanout_core.py's
+    _fan_out_open() docstring for exactly what this measures (our own
+    pipeline's dispatch speed, not a broker-to-broker clock comparison)."""
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    last_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    last_30d = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+
+    success_today_response = execute_with_retry(
+        lambda: (
+            supabase_client.table("copy_events")
+            .select("id", count="exact")
+            .eq("status", "success")
+            .gte("created_at", today_start)
+            .execute()
+        )
+    )
+    copied_today = success_today_response.count or 0
+
+    window_response = execute_with_retry(
+        lambda: (
+            supabase_client.table("copy_events")
+            .select("status")
+            .gte("created_at", last_24h)
+            .execute()
+        )
+    )
+    window_rows = window_response.data or []
+    failed_24h = sum(1 for r in window_rows if r["status"] == "failed")
+    total_24h = len(window_rows)
+    failed_pct = round((failed_24h / total_24h * 100), 2) if total_24h else 0.0
+
+    latency_response = execute_with_retry(
+        lambda: (
+            supabase_client.table("copy_events")
+            .select("latency_ms")
+            .eq("status", "success")
+            .gte("created_at", last_30d)
+            .execute()
+        )
+    )
+    latencies_ms = [r["latency_ms"] for r in (latency_response.data or []) if r.get("latency_ms") is not None]
+    avg_relay_latency_seconds_30d = round((sum(latencies_ms) / len(latencies_ms)) / 1000, 2) if latencies_ms else None
+
+    return {
+        "copied_today": copied_today,
+        "failed_copies_24h": failed_24h,
+        "failed_copies_pct_24h": failed_pct,
+        "avg_relay_latency_seconds_30d": avg_relay_latency_seconds_30d,
+        "avg_relay_latency_sample_size_30d": len(latencies_ms),
+    }
 
 
 def get_revenue_by_month(supabase_client: Any, months: int = 12) -> list[dict]:
@@ -116,6 +178,8 @@ def get_admin_summary(supabase_client: Any) -> dict:
     )
     at_risk_grace = grace_response.count or 0
 
+    copy_stats = get_copy_stats(supabase_client)
+
     return {
         "mrr": round(mrr, 2),
         "mrr_change_pct": round(mrr_change_pct, 1),
@@ -125,17 +189,21 @@ def get_admin_summary(supabase_client: Any) -> dict:
         "payouts_pending_amount": round(payouts_pending_amount, 2),
         "payouts_pending_count": len(payout_rows),
         "at_risk_wallets_count": at_risk_debt + at_risk_grace,
+        "copied_today": copy_stats["copied_today"],
+        "failed_copies_24h": copy_stats["failed_copies_24h"],
+        "failed_copies_pct_24h": copy_stats["failed_copies_pct_24h"],
     }
 
 
 def list_all_users(supabase_client: Any) -> list[dict]:
-    """No email (backend has no access to auth.users without the
-    service-role admin API - deliberately not used here per the earlier
-    "email not needed" decision). lifetimeValue is the simplest honest
-    number available: sum of all wallet_transactions for the account,
-    every type combined - not topups-only or earnings-only."""
+    """lifetimeValue is the simplest honest number available: sum of all
+    wallet_transactions for the account, every type combined - not
+    topups-only or earnings-only. Email is resolved via the service-role
+    admin auth API (one call per distinct user_id) - the accounts table
+    itself has no email column, only user_id, which maps 1:1 to a
+    Supabase-auth user."""
     accounts_response = execute_with_retry(
-        lambda: supabase_client.table("accounts").select("account_id, role, status, created_at").execute()
+        lambda: supabase_client.table("accounts").select("account_id, user_id, role, status, created_at").execute()
     )
     accounts = accounts_response.data or []
     if not accounts:
@@ -154,9 +222,19 @@ def list_all_users(supabase_client: Any) -> list[dict]:
     for row in tx_response.data or []:
         lifetime_value[row["account_id"]] += abs(float(row["amount"]))
 
+    email_by_user_id: dict[str, str | None] = {}
+    for user_id in {a["user_id"] for a in accounts if a.get("user_id")}:
+        try:
+            user_response = supabase_client.auth.admin.get_user_by_id(user_id)
+            email_by_user_id[user_id] = getattr(user_response.user, "email", None)
+        except Exception:
+            logger.exception("Failed to resolve email for user_id %s - leaving blank for this row", user_id)
+            email_by_user_id[user_id] = None
+
     return [
         {
             "account_id": a["account_id"],
+            "email": email_by_user_id.get(a.get("user_id")),
             "role": a["role"],
             "status": a["status"],
             "joined": a["created_at"],
@@ -190,37 +268,41 @@ def get_symbol_exposure(supabase_client: Any) -> list[dict]:
     )
 
 
-def get_top_masters(supabase_client: Any, limit: int = 10) -> list[dict]:
-    """followers/revenue/rate are solid (same sources as /admin/masters
-    and /admin/masters/{id}). net_pnl is a deliberate best-effort, not a
-    true net figure: billed_deals only contains deals that were actually
-    profit-share-billed, i.e. profitable closed trades - losing trades
-    are never written there (profit_share.py only bills entry=="out" and
-    pnl>0). So this sums realized profit on billed trades, NOT true net
-    P&L including losses. There's no drawdown figure at all - nothing in
-    the schema tracks equity curve/peak-to-trough, so it's omitted
-    rather than faked."""
+def get_top_masters(supabase_client: Any, fanout: Any, limit: int = 10) -> list[dict]:
+    """followers/revenue are solid (same sources as /admin/masters and
+    /admin/masters/{id}). net_pnl is computed live from each master's own
+    trade history via their connected agent (same approach as the
+    master-facing trade stats) - only currently-connected masters
+    contribute a real figure; a master who's offline right now shows
+    net_pnl=None rather than a stale or fabricated number. rate_percent
+    and billed_pnl are gone along with the performance-fee feature -
+    billed_deals stops getting new rows now that profit-share billing is
+    disabled, so it's no longer a meaningful source for anything here.
+    There's still no drawdown figure - nothing in the schema tracks
+    equity curve/peak-to-trough, so it's omitted rather than faked."""
     all_masters = master_profiles.list_all_masters(supabase_client)
-
-    deals_response = execute_with_retry(
-        lambda: supabase_client.table("billed_deals").select("master_account_id, pnl").execute()
-    )
-    billed_pnl: dict[str, float] = defaultdict(float)
-    for row in deals_response.data or []:
-        billed_pnl[row["master_account_id"]] += float(row["pnl"])
 
     rows = []
     for m in all_masters:
         account_id = m["account_id"]
         earnings = profit_share.get_master_earnings(account_id, supabase_client)
+
+        agent = fanout.master_agents.get(account_id)
+        net_pnl = None
+        if agent is not None:
+            try:
+                trades = trade_history.get_account_trade_history(agent)
+                net_pnl = round(sum(float(t.get("pnl") or 0) for t in trades if t.get("entry") == "out"), 2)
+            except Exception:
+                logger.exception("Failed to compute live net_pnl for master %s, leaving as None", account_id)
+
         rows.append(
             {
                 "account_id": account_id,
                 "name": m["display_name"],
                 "followers": roster.count_active_followers(account_id, supabase_client),
                 "revenue": round(earnings["total_earned"], 2),
-                "rate_percent": m["rate_percent"],
-                "billed_pnl": round(billed_pnl.get(account_id, 0.0), 2),
+                "net_pnl": net_pnl,
             }
         )
 

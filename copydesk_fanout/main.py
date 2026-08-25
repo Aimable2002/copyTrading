@@ -103,7 +103,7 @@ def _run_supabase_mode(serve: bool) -> None:
     pair_store = OrderPairStore(supabase_client=supabase)
     pair_store.rebuild_from_supabase() 
 
-    fanout = FanoutCore(config_store, pair_store)
+    fanout = FanoutCore(config_store, pair_store, supabase_client=supabase)
 
     accounts_response = execute_with_retry(
         lambda: supabase.table("accounts").select("*").in_("status", ["live", "paused"]).execute()

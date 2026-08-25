@@ -33,6 +33,8 @@ from ..provisioning import account_lifecycle
 from ..masters import challenges, master_profiles, roster
 from ..billing import billing, master_rate, payouts, profit_share, wallet
 from ..core import trade_history
+from . import admin_analytics
+from ..infra.supabase_client import execute_with_retry
 from ..provisioning.account_lifecycle import LifecycleError
 from ..billing.billing import BillingError
 from ..masters.challenges import ChallengeError
@@ -61,9 +63,10 @@ class ProvisionRequest(BaseModel):
     login: str
     password: str
     server: str
+    broker: str | None = None
     # Only required when role == "follower":
     master_account_id: str | None = None
-    multiplier: float | None = None
+    sizing_value: float | None = None
     sizing_mode: SizingMode | None = None
 
 
@@ -74,6 +77,7 @@ class PauseRequest(BaseModel):
 class MasterProfileRequest(BaseModel):
     display_name: str
     bio: str = ""
+    country: str | None = None
 
 
 class TopUpRequest(BaseModel):
@@ -101,6 +105,8 @@ class RequestPayoutRequest(BaseModel):
     amount: float
     recipient_name: str
     recipient_phone: str
+    payout_method: Literal["mobile_money", "bank_transfer", "crypto"]
+    payout_account_number: str
 
 
 def _authenticate(authorization: str | None) -> str:
@@ -197,7 +203,7 @@ def create_api_app(
                 fanout=fanout,
                 supabase_client=supabase_client,
                 master_account_id=body.master_account_id,
-                multiplier=body.multiplier,
+                sizing_value=body.sizing_value,
                 sizing_mode=body.sizing_mode,
             )
         except ProvisioningError as exc:
@@ -211,7 +217,8 @@ def create_api_app(
                     user_id=user_id, role=body.role, account_id=account_id,
                     fanout=fanout, supabase_client=supabase_client,
                     account_user_map=account_user_map, agents=agents,
-                    master_account_id=body.master_account_id, multiplier=body.multiplier, sizing_mode=body.sizing_mode,
+                    master_account_id=body.master_account_id, sizing_value=body.sizing_value,
+                    sizing_mode=body.sizing_mode, broker=body.broker,
                 )
             except ProvisioningError as exc:
                 logger.exception("Provisioning failed for user %s (account_id %s)", user_id, account_id)
@@ -225,7 +232,8 @@ def create_api_app(
                     user_id=user_id, role=body.role, account_id=account_id,
                     fanout=fanout, supabase_client=supabase_client,
                     account_user_map=account_user_map, agents=agents,
-                    master_account_id=body.master_account_id, multiplier=body.multiplier, sizing_mode=body.sizing_mode,
+                    master_account_id=body.master_account_id, sizing_value=body.sizing_value,
+                    sizing_mode=body.sizing_mode, broker=body.broker,
                 )
             except ProvisioningError:
                 logger.exception("Provisioning failed for user %s (account_id %s) during stalled wait", user_id, account_id)
@@ -335,15 +343,41 @@ def create_api_app(
         try:
             return master_profiles.upsert_profile(
                 account_id=account_id, user_id=user_id, display_name=body.display_name,
-                bio=body.bio, supabase_client=supabase_client,
+                bio=body.bio, country=body.country, supabase_client=supabase_client,
             )
         except MasterProfileError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/masters/directory")
     def directory(authorization: str | None = Header(default=None)):
-        _authenticate(authorization)  # any logged-in user can browse, just not anonymous scraping
+        # Genuinely public - no auth check. The marketing landing page shows
+        # masters to logged-out visitors, and this is the one endpoint the
+        # frontend was told not to attach a token to at all - requiring auth
+        # here was a mismatch against that contract, not an intentional gate.
         return master_profiles.list_public_masters(supabase_client)
+
+    @app.get("/platform/stats")
+    def platform_stats():
+        # Public, no auth - shown on the marketing page to logged-out
+        # visitors and in the sidebar's relay-status widget for logged-in
+        # users alike. Real relay latency (see admin_analytics.get_copy_stats),
+        # not "time since this account's live_account_state row last
+        # updated" - that was a proxy the frontend used before this existed
+        # and should be replaced with this endpoint instead.
+        accounts_response = execute_with_retry(
+            lambda: supabase_client.table("accounts").select("account_id, role, status").execute()
+        )
+        rows = accounts_response.data or []
+        masters_count = sum(1 for r in rows if r["role"] == "master" and r["status"] == "live")
+        live_accounts_count = sum(1 for r in rows if r["status"] == "live")
+        copy_stats = admin_analytics.get_copy_stats(supabase_client)
+        return {
+            "masters_count": masters_count,
+            "live_accounts_count": live_accounts_count,
+            "copied_today": copy_stats["copied_today"],
+            "avg_relay_latency_seconds_30d": copy_stats["avg_relay_latency_seconds_30d"],
+            "avg_relay_latency_sample_size_30d": copy_stats["avg_relay_latency_sample_size_30d"],
+        }
 
     @app.get("/accounts/{account_id}/trades")
     def trades(account_id: str, authorization: str | None = Header(default=None)):
@@ -466,24 +500,28 @@ def create_api_app(
     # Master rate + earnings
     # ----------------------------------------------------------------
 
-    @app.get("/masters/{account_id}/rate")
-    def get_master_rate(account_id: str, authorization: str | None = Header(default=None)):
-        _authenticate(authorization)  # public rate - any authenticated user, no ownership check, same as /masters/directory
-        rate = master_rate.get_public_rate(account_id, supabase_client)
-        if rate is None:
-            raise HTTPException(status_code=404, detail=f"Master {account_id} has not set a rate yet")
-        return rate
-
-    @app.post("/masters/{account_id}/rate")
-    def set_master_rate(account_id: str, body: SetRateRequest, authorization: str | None = Header(default=None)):
-        user_id = _authenticate(authorization)
-        role = _resolve_account_owner(account_user_map, account_id, user_id)
-        if role != "master":
-            raise HTTPException(status_code=422, detail="Only master accounts can set a rate")
-        try:
-            return master_rate.set_rate(account_id, body.rate_percent, body.platform_cut_percent, supabase_client)
-        except MasterRateError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # Performance-fee rate feature disabled: the platform monetizes via
+    # follower subscription packages only now, not a per-master profit
+    # share. Kept commented rather than deleted in case this is revisited.
+    #
+    # @app.get("/masters/{account_id}/rate")
+    # def get_master_rate(account_id: str, authorization: str | None = Header(default=None)):
+    #     _authenticate(authorization)  # public rate - any authenticated user, no ownership check, same as /masters/directory
+    #     rate = master_rate.get_public_rate(account_id, supabase_client)
+    #     if rate is None:
+    #         raise HTTPException(status_code=404, detail=f"Master {account_id} has not set a rate yet")
+    #     return rate
+    #
+    # @app.post("/masters/{account_id}/rate")
+    # def set_master_rate(account_id: str, body: SetRateRequest, authorization: str | None = Header(default=None)):
+    #     user_id = _authenticate(authorization)
+    #     role = _resolve_account_owner(account_user_map, account_id, user_id)
+    #     if role != "master":
+    #         raise HTTPException(status_code=422, detail="Only master accounts can set a rate")
+    #     try:
+    #         return master_rate.set_rate(account_id, body.rate_percent, body.platform_cut_percent, supabase_client)
+    #     except MasterRateError as exc:
+    #         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/masters/{account_id}/earnings")
     def get_master_earnings(account_id: str, authorization: str | None = Header(default=None)):
@@ -492,6 +530,14 @@ def create_api_app(
         if role != "master":
             raise HTTPException(status_code=422, detail="Only master accounts have earnings")
         return profit_share.get_master_earnings(account_id, supabase_client)
+
+    @app.get("/masters/{account_id}/followers")
+    def get_master_followers(account_id: str, authorization: str | None = Header(default=None)):
+        user_id = _authenticate(authorization)
+        role = _resolve_account_owner(account_user_map, account_id, user_id)
+        if role != "master":
+            raise HTTPException(status_code=422, detail="Only master accounts have followers")
+        return roster.get_master_followers(account_id, supabase_client)
 
     @app.get("/masters/{account_id}/payouts")
     def list_own_payouts(account_id: str, authorization: str | None = Header(default=None)):
@@ -512,32 +558,43 @@ def create_api_app(
         try:
             return payouts.request_payout(
                 account_id, body.amount, body.recipient_name, body.recipient_phone, supabase_client,
+                payout_method=body.payout_method, payout_account_number=body.payout_account_number,
             )
         except payouts.PayoutError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # ----------------------------------------------------------------
-    # Challenges - browsing/enrolling/status/history. Challenge CRUD
-    # itself (creating/editing a challenge) is NOT here - that's a direct-
-    # Supabase admin surface, not a backend route, per the "admin uses
-    # backend where necessary, plain config CRUD doesn't need it" decision.
+    # Challenges - browsing/status/history. Challenge CRUD itself
+    # (creating/editing a challenge) is NOT here - that's a direct-Supabase
+    # admin surface, not a backend route, per the "admin uses backend
+    # where necessary, plain config CRUD doesn't need it" decision.
     # ----------------------------------------------------------------
 
     @app.get("/challenges")
-    def list_challenges_route(authorization: str | None = Header(default=None)):
-        _authenticate(authorization)  # any authenticated user - same as /masters/directory
+    def list_challenges_route():
+        # Genuinely public - same reasoning as /masters/directory above.
         return {"challenges": challenges.list_challenges(supabase_client)}
 
-    @app.post("/masters/{account_id}/challenges/enroll")
-    def enroll_challenge(account_id: str, body: EnrollChallengeRequest, authorization: str | None = Header(default=None)):
-        user_id = _authenticate(authorization)
-        role = _resolve_account_owner(account_user_map, account_id, user_id)
-        if role != "master":
-            raise HTTPException(status_code=422, detail="Only master accounts can enroll in challenges")
-        try:
-            return challenges.enroll(master_account_id=account_id, challenge_id=body.challenge_id, supabase_client=supabase_client)
-        except ChallengeError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # Free direct-enroll is disabled - every challenge now requires a paid
+    # entry, resolved through POST /payments/checkout with
+    # purpose="challenge_entry" and confirmed via the Flutterwave webhook
+    # (see payments/webhooks.py's _handle_charge_completed, which is the
+    # only place challenges.enroll() is called now). enroll() itself
+    # requires starting_equity - the master's live equity at the moment of
+    # confirmed payment - which this endpoint had no way to resolve
+    # correctly, and allowing it to enroll for free would bypass the entry
+    # fee entirely. Kept commented rather than deleted.
+    #
+    # @app.post("/masters/{account_id}/challenges/enroll")
+    # def enroll_challenge(account_id: str, body: EnrollChallengeRequest, authorization: str | None = Header(default=None)):
+    #     user_id = _authenticate(authorization)
+    #     role = _resolve_account_owner(account_user_map, account_id, user_id)
+    #     if role != "master":
+    #         raise HTTPException(status_code=422, detail="Only master accounts can enroll in challenges")
+    #     try:
+    #         return challenges.enroll(master_account_id=account_id, challenge_id=body.challenge_id, supabase_client=supabase_client)
+    #     except ChallengeError as exc:
+    #         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/masters/{account_id}/challenges/{challenge_id}/leave")
     def leave_challenge(account_id: str, challenge_id: str, authorization: str | None = Header(default=None)):

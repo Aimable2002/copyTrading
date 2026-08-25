@@ -167,7 +167,7 @@ def _sync_active_subscription(follower_account_id: str, new_master_account_id: s
         if not history.data:
             raise RosterError(
                 f"Follower {follower_account_id} has no subscription history to carry sizing "
-                f"settings from - cannot determine multiplier/sizing_mode for the new subscription"
+                f"settings from - cannot determine sizing_mode/sizing_value for the new subscription"
             )
         sizing_template = history.data[0]
 
@@ -181,9 +181,8 @@ def _sync_active_subscription(follower_account_id: str, new_master_account_id: s
         )
     )
     new_row_fields = {
-        "multiplier": sizing_template["multiplier"],
         "sizing_mode": sizing_template["sizing_mode"],
-        "fixed_master_balance": sizing_template.get("fixed_master_balance"),
+        "sizing_value": sizing_template.get("sizing_value"),
         "active": True,
     }
     if existing_for_new_master.data:
@@ -256,3 +255,61 @@ def get_current_slot(billing_period_id: str, follower_account_id: str, supabase_
     )
     rows = response.data or []
     return rows[0] if rows else None
+
+
+def get_master_followers(master_account_id: str, supabase_client: Any) -> list[dict]:
+    """Master-facing: who is currently copying this master, with just
+    enough detail for the master's own dashboard (broker, live equity,
+    sizing, since-date, status). Scoped to `active=True` subscriptions only
+    (the live trade-routing table) - same source as count_active_followers,
+    just returning the rows instead of a count. Never exposes anything
+    beyond what's already visible elsewhere per-account (no email, no login,
+    no balance history)."""
+    subs_response = execute_with_retry(
+        lambda: (
+            supabase_client.table("subscriptions")
+            .select("follower_account_id, sizing_mode, sizing_value, active, created_at")
+            .eq("master_account_id", master_account_id)
+            .eq("active", True)
+            .execute()
+        )
+    )
+    subs = subs_response.data or []
+    if not subs:
+        return []
+
+    follower_ids = [s["follower_account_id"] for s in subs]
+
+    accounts_response = execute_with_retry(
+        lambda: (
+            supabase_client.table("accounts")
+            .select("account_id, broker, platform, status")
+            .in_("account_id", follower_ids)
+            .execute()
+        )
+    )
+    accounts_by_id = {a["account_id"]: a for a in (accounts_response.data or [])}
+
+    live_response = execute_with_retry(
+        lambda: (
+            supabase_client.table("live_account_state")
+            .select("account_id, equity")
+            .in_("account_id", follower_ids)
+            .execute()
+        )
+    )
+    equity_by_id = {r["account_id"]: r.get("equity") for r in (live_response.data or [])}
+
+    return [
+        {
+            "follower_account_id": s["follower_account_id"],
+            "broker": accounts_by_id.get(s["follower_account_id"], {}).get("broker"),
+            "platform": accounts_by_id.get(s["follower_account_id"], {}).get("platform", "mt5"),
+            "equity": equity_by_id.get(s["follower_account_id"]),
+            "sizing_mode": s["sizing_mode"],
+            "sizing_value": s.get("sizing_value"),
+            "since": s["created_at"],
+            "status": accounts_by_id.get(s["follower_account_id"], {}).get("status", "unknown"),
+        }
+        for s in subs
+    ]

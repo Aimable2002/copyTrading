@@ -33,5 +33,9 @@ class BaseAgent:
     def balance(self) -> float | None:
         return self.terminal.balance
 
+    @property
+    def equity(self) -> float | None:
+        return self.terminal.equity
+
     def fetch_historic_trades(self, lookback_days: int = 30, timeout: float = 10.0) -> dict:
         return self.terminal.get_historic_trades(lookback_days)

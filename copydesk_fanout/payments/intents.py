@@ -32,7 +32,8 @@ def _now_iso() -> str:
 
 def record_intent(
     *, reference: str, account_id: str, user_id: str, purpose: str, package_code: str | None,
-    amount_usd: float, currency: str, amount_charged: float, method: str, supabase_client: Any,
+    challenge_id: str | None, amount_usd: float, currency: str, amount_charged: float, method: str,
+    supabase_client: Any,
 ) -> dict:
     response = execute_with_retry(
         lambda: (
@@ -44,6 +45,7 @@ def record_intent(
                     "user_id": user_id,
                     "purpose": purpose,
                     "package_code": package_code,
+                    "challenge_id": challenge_id,
                     "amount_usd": amount_usd,
                     "currency": currency,
                     "amount_charged": amount_charged,

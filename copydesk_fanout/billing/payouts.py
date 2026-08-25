@@ -64,7 +64,7 @@ def _latest_period_end(master_account_id: str, supabase_client: Any) -> str | No
 
 def request_payout(
     master_account_id: str, amount: float, recipient_name: str, recipient_phone: str, supabase_client: Any,
-    *, currency: str | None = None, network: str | None = None,
+    *, payout_method: str, payout_account_number: str, currency: str | None = None, network: str | None = None,
 ) -> dict:
     if amount <= 0:
         raise PayoutError("Amount must be greater than zero")
@@ -83,12 +83,20 @@ def request_payout(
         "amount": amount,
         "recipient_name": recipient_name,
         "recipient_phone": recipient_phone,
+        # How and where admin should manually send this payout (Mobile
+        # Money / Bank Transfer / Crypto + the actual number/account/wallet
+        # address) - purely informational for the manual-settlement flow,
+        # NOT the same thing as currency/network below.
+        "payout_method": payout_method,
+        "payout_account_number": payout_account_number,
         "status": "pending",
     }
     # Both optional and nullable - see approve_payout()'s docstring for why:
-    # only present when the caller (currently nothing does yet - the
-    # existing /masters/{id}/payouts request body has no such fields) opts
-    # into a real Flutterwave transfer instead of the manual-payout flow.
+    # only present when the caller opts into a real, automated Flutterwave
+    # mobile-money transfer instead of the manual-payout flow above. This
+    # is a separate feature from payout_method/payout_account_number - those
+    # are always collected for every request regardless of whether this
+    # automated path is ever used.
     if currency:
         row["currency"] = currency
     if network:

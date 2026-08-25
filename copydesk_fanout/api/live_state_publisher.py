@@ -5,6 +5,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from ..core.base_agent import BaseAgent
+from ..masters import challenge_watcher
 from .socket_server import emit_account_state
 from ..infra.supabase_client import execute_with_retry
 
@@ -28,6 +29,11 @@ def _serialize_open_positions(open_orders: dict) -> list[dict[str, Any]]:
                 "open_price": order.get("open_price"),
                 "SL": order.get("SL"),
                 "TP": order.get("TP"),
+                # MT5's position_to_order_dict() now captures these; cTrader's
+                # CTraderMasterAgent.open_positions already merges in "pnl"
+                # per position internally - both just pass through here.
+                "current_price": order.get("current_price"),
+                "pnl": order.get("pnl"),
             }
         )
     return positions
@@ -97,6 +103,11 @@ async def run_live_state_publisher(
                 except Exception:
                     logger.exception("Socket emit failed for account %s", account_id)
                 await loop.run_in_executor(None, _write_live_state_row, supabase_client, account_id, state)
+
+                if account_id in fanout.master_agents:
+                    await loop.run_in_executor(
+                        None, challenge_watcher.check_enrollment, account_id, state["equity"], supabase_client,
+                    )
             except Exception:
                 logger.exception("Live-state publish tick failed for account %s", account_id)
 
