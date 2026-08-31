@@ -46,7 +46,7 @@ _FLW_TOKEN_URL = os.environ.get(
 _FLW_API_BASE_SANDBOX = os.environ.get(
     "FLW_API_BASE_SANDBOX", "https://developersandbox-api.flutterwave.com"
 )
-_FLW_API_BASE_LIVE = os.environ.get("FLW_API_BASE_LIVE", "https://api.flutterwave.com")
+_FLW_API_BASE_LIVE = os.environ.get("FLW_API_BASE_LIVE")
 
 
 def _api_base() -> str:

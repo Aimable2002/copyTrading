@@ -393,9 +393,11 @@ def create_api_app(
         who to follow: /accounts/{id}/trades only ever worked for the
         account's OWNER. This is the same underlying data, gated instead
         by the master's own public opt-in (master_profiles.is_public) -
-        any authenticated user can call this for any master who's chosen
-        to be visible, nobody else's data is reachable through it."""
-        _authenticate(authorization)
+        anyone can call this for any master who's chosen to be visible,
+        nobody else's data is reachable through it. Genuinely public, same
+        reasoning as /masters/directory: the landing page renders these
+        stats for logged-out visitors, so this must not require a Bearer
+        token."""
         if not master_profiles.is_public_master(account_id, supabase_client):
             raise HTTPException(status_code=404, detail=f"No public master profile for {account_id}")
         agent = fanout.master_agents.get(account_id)
